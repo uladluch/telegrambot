@@ -227,26 +227,55 @@ async function isYoutubeShort(videoId: string): Promise<boolean> {
   }
 }
 
+// Русскоязычному каналу русская озвучка не нужна — по кириллице в названии
+// канала/ролика прячем RU-ряд, чтобы не захламлять карточку.
+function hasCyrillic(s: string) {
+  return /[а-яё]/i.test(s);
+}
+
 // Карточка YouTube-видео: Telegram сам развернёт превью из ссылки, снизу — кнопки.
 // Верхний ряд — оригинал: "v:<videoId>" (видео) / "a:<videoId>" (аудио).
 // Нижний ряд — русская закадровая озвучка (Яндекс): "rv:" (видео) / "ra:" (аудио).
 async function youtubeCard(chatId: string, ep: Episode, feedTitle: string) {
   const url = ep.link ?? `https://www.youtube.com/watch?v=${ep.guid}`;
   const date = fmtDate(ep.pubDate);
+  const keyboard = [[
+    { text: "⬇️ Видео", callback_data: `v:${ep.guid}` },
+    { text: "🎧 Аудио", callback_data: `a:${ep.guid}` },
+  ]];
+  if (!hasCyrillic(`${feedTitle} ${ep.title}`)) {
+    keyboard.push([
+      { text: "🎬 RU", callback_data: `rv:${ep.guid}` },
+      { text: "🎧 RU", callback_data: `ra:${ep.guid}` },
+    ]);
+  }
   await tg("sendMessage", {
     chat_id: chatId,
     text: `🎬 <b>${esc(feedTitle)}</b>${date ? `\n📅 ${date}` : ""}\n${esc(url)}`,
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+// Карточка для присланной напрямую ссылки на YouTube — без команды и подписки.
+// Язык видео неизвестен, поэтому RU-ряд показываем всегда.
+async function linkCard(chatId: string, videoId: string) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: esc(url),
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: false, url, prefer_large_media: true },
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "⬇️ Видео", callback_data: `v:${ep.guid}` },
-          { text: "🎧 Аудио", callback_data: `a:${ep.guid}` },
+          { text: "⬇️ Видео", callback_data: `v:${videoId}` },
+          { text: "🎧 Аудио", callback_data: `a:${videoId}` },
         ],
         [
-          { text: "🎬 RU", callback_data: `rv:${ep.guid}` },
-          { text: "🎧 RU", callback_data: `ra:${ep.guid}` },
+          { text: "🎬 RU", callback_data: `rv:${videoId}` },
+          { text: "🎧 RU", callback_data: `ra:${videoId}` },
         ],
       ],
     },
@@ -299,17 +328,17 @@ async function collectEpisodes(
 
 const HELP = `<b>Команды:</b>
 /latest — эпизоды всех подписок за последние сутки
-/last5 номер — 5 последних эпизодов подписки
-/last10 номер — 10 последних
-/list — список подписок
+/list — подписки кнопками: жми на любую, пришлю 5 последних
+/last5 /last10 номер — последние эпизоды подписки
 /add ссылка или название — подкаст или YouTube-канал
 /del номер — отписаться
 /video ссылка — скачать видео с YouTube (до 720p)
 /audio ссылка — вытащить аудио из YouTube-видео
+/status — что сейчас в очереди и ошибки за сутки
 /clear — очистить переписку с ботом (подписки не трогает)
 /help — справка
 
-Ничего не приходит само — эпизоды запрашиваешь через /latest или /last5. На карточке жмёшь кнопку, и бот присылает файл (видео до 2 ГБ). На YouTube-карточке есть ещё ряд «🎬 RU» / «🎧 RU» — русская закадровая озвучка через Яндекс (перевод идёт на серверах Яндекса, занимает пару минут). Свои эпизоды храни у себя — на сервере ничего не остаётся.`;
+Самое простое: пришли (или перешли) ссылку на YouTube-видео без всяких команд — отвечу карточкой с кнопками. На карточке жмёшь кнопку, и бот присылает файл (видео до 2 ГБ). Ряд «🎬 RU» / «🎧 RU» — русская закадровая озвучка через Яндекс (перевод идёт на серверах Яндекса, занимает пару минут). Свои эпизоды храни у себя — на сервере ничего не остаётся.`;
 
 async function getOwner(): Promise<string | null> {
   const { data } = await db.from("bot_state").select("value").eq("key", "owner_chat_id").maybeSingle();
@@ -386,14 +415,24 @@ async function cmdAdd(chatId: string, arg: string) {
   );
 }
 
+// Каждая подписка — кнопка: жмёшь и получаешь 5 последних эпизодов.
+// Не нужно запоминать номер и печатать /last5 N. callback_data: "l5:<subId>".
 async function cmdList(chatId: string) {
   const { data: subs } = await db.from("subscriptions").select("*").order("id");
   if (!subs?.length) {
     await say(chatId, "Подписок пока нет. Добавь: <code>/add joe rogan</code>");
     return;
   }
-  const lines = (subs as Sub[]).map((s) => `#${s.id} ${s.kind === "youtube" ? "🎬" : "🎧"} ${esc(s.title ?? s.feed_url)}`);
-  await say(chatId, "<b>Подписки:</b>\n" + lines.join("\n"));
+  const rows = (subs as Sub[]).map((s) => [{
+    text: `#${s.id} ${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`,
+    callback_data: `l5:${s.id}`,
+  }]);
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: "<b>Подписки</b> — жми на любую, пришлю 5 последних эпизодов:",
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: rows },
+  });
 }
 
 async function cmdDel(chatId: string, arg: string) {
@@ -460,6 +499,37 @@ async function cmdLast(chatId: string, arg: string, n: number) {
   if (picked.length === 0) await say(chatId, "В фиде нет эпизодов");
 }
 
+const JOB_LABEL: Record<string, string> = {
+  send_audio: "🎧 подкаст",
+  yt_video: "⬇️ видео",
+  yt_audio: "🎧 аудио",
+  yt_video_ru: "🎬 видео RU",
+  yt_audio_ru: "🎧 аудио RU",
+};
+
+// /status — что в очереди у воркера и какие ошибки были за сутки
+async function cmdStatus(chatId: string) {
+  const { data: active } = await db.from("jobs").select("*").in("status", ["pending", "running"]).order("id");
+  const dayAgo = new Date(Date.now() - DAY_MS).toISOString();
+  const { data: errs } = await db.from("jobs").select("*").eq("status", "error")
+    .gte("updated_at", dayAgo).order("id", { ascending: false }).limit(3);
+  const lines: string[] = [];
+  if (active?.length) {
+    lines.push("<b>В работе:</b>");
+    for (const j of active) {
+      const url = String(j.payload?.url ?? "").slice(0, 60);
+      lines.push(`${j.status === "running" ? "▶️" : "⏳"} ${JOB_LABEL[j.type] ?? j.type} ${esc(url)}`);
+    }
+  } else {
+    lines.push("Очередь пуста — ничего не качается");
+  }
+  if (errs?.length) {
+    lines.push("", "<b>Ошибки за сутки:</b>");
+    for (const j of errs) lines.push(`⚠️ ${JOB_LABEL[j.type] ?? j.type}: ${esc(String(j.error ?? "").slice(0, 100))}`);
+  }
+  await say(chatId, lines.join("\n"));
+}
+
 // /clear — удаляет сообщения бота в чате (диапазоном id). Подписки и данные не трогает.
 // Telegram даёт удалять сообщения бота только за последние 48 часов, остальное молча пропустится.
 async function cmdClear(chatId: string, upToMsgId: number) {
@@ -484,11 +554,18 @@ async function handleCallback(cbq: Record<string, any>) {
     rv: { type: "yt_video_ru", note: "Перевожу видео на русский" },
     ra: { type: "yt_audio_ru", note: "Перевожу аудио на русский" },
   };
-  if (chatId !== owner || !(YT_JOBS[kind] || kind === "pd")) {
+  if (chatId !== owner || !(YT_JOBS[kind] || kind === "pd" || kind === "l5")) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
     return;
   }
   try {
+    // l5:<subId> — кнопка из /list: показать 5 последних эпизодов подписки.
+    // Кнопки списка не трогаем — список остаётся рабочим для следующих нажатий.
+    if (kind === "l5") {
+      await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Смотрю эпизоды…" }).catch(() => {});
+      await cmdLast(chatId, parts[1], 5);
+      return;
+    }
     let note: string;
     if (YT_JOBS[kind]) {
       const url = `https://www.youtube.com/watch?v=${parts[1]}`;
@@ -505,11 +582,15 @@ async function handleCallback(cbq: Record<string, any>) {
       note = "Скачиваю эпизод";
     }
     await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: `${note}…` });
-    // Убираем кнопки, чтобы не нажать дважды
+    // Убираем только нажатую кнопку (защита от двойного нажатия) —
+    // остальные остаются: можно взять и видео, и аудио, и RU с одной карточки
+    const kb = (cbq.message?.reply_markup?.inline_keyboard ?? [])
+      .map((row: Record<string, string>[]) => row.filter((b) => b.callback_data !== cbq.data))
+      .filter((row: Record<string, string>[]) => row.length > 0);
     await tg("editMessageReplyMarkup", {
       chat_id: chatId,
       message_id: cbq.message.message_id,
-      reply_markup: { inline_keyboard: [] },
+      reply_markup: { inline_keyboard: kb },
     }).catch(() => {});
     if (kind === "rv" || kind === "ra") {
       await say(chatId, `⏳ ${note} — Яндекс переводит на своих серверах, это займёт несколько минут`);
@@ -522,10 +603,14 @@ async function handleCallback(cbq: Record<string, any>) {
   }
 }
 
+// Ловим id видео в присланном тексте: youtube.com/watch, youtu.be, shorts, live, embed
+const YT_LINK = /(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^\s]*&)?v=|shorts\/|live\/|embed\/))([\w-]{11})/i;
+
 async function handleUpdate(update: Record<string, any>) {
   const msg = update.message;
   const chatId = String(msg?.chat?.id ?? "");
-  const textMsg: string = msg?.text ?? "";
+  // caption — на случай пересланного поста с видео/картинкой и ссылкой в подписи
+  const textMsg: string = msg?.text ?? msg?.caption ?? "";
   if (!chatId || !textMsg) return;
 
   // Личный бот: первый, кто напишет /start, становится владельцем, остальных игнорируем
@@ -541,6 +626,14 @@ async function handleUpdate(update: Record<string, any>) {
   const [cmd, ...rest] = textMsg.trim().split(/\s+/);
   const arg = rest.join(" ");
   try {
+    // Не команда — возможно, просто ссылка на видео (или пересланное сообщение с ней):
+    // отвечаем карточкой с кнопками, никаких команд запоминать не нужно
+    if (!cmd.startsWith("/")) {
+      const yt = textMsg.match(YT_LINK);
+      if (yt) await linkCard(chatId, yt[1]);
+      else await say(chatId, "Пришли ссылку на YouTube-видео — отвечу карточкой с кнопками. Остальное: /help");
+      return;
+    }
     switch (cmd.split("@")[0].toLowerCase()) {
       case "/start":
       case "/help":
@@ -576,6 +669,9 @@ async function handleUpdate(update: Record<string, any>) {
         await say(chatId, "⏳ Взял в работу — пришлю файлом, когда скачается");
         break;
       }
+      case "/status":
+        await cmdStatus(chatId);
+        break;
       case "/clear":
         await cmdClear(chatId, msg.message_id);
         break;
