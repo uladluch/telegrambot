@@ -1,0 +1,37 @@
+name: Deploy worker to Railway
+
+# Деплой воркера на Railway из GitHub Actions (раннеры не за egress-политикой
+# песочницы, поэтому дотягиваются до Railway). Триггерится пушем в main,
+# затрагивающим worker/**, и вручную кнопкой «Run workflow».
+#
+# Разовая настройка (с телефона):
+#   1. Railway → проект feed → Settings → Tokens → создать Project Token
+#      (scope: environment production). Скопировать значение.
+#   2. GitHub → репозиторий telegrambot → Settings → Secrets and variables →
+#      Actions → New repository secret: имя RAILWAY_TOKEN, значение — токен.
+# После этого каждый пуш в worker/** сам пересобирает воркер.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+      - name: Deploy worker
+        # Контекст сборки — корень репы (Dockerfile делает COPY worker/worker.py).
+        # Project Token сам задаёт проект и окружение, поэтому хватает --service.
+        run: railway up --service worker --ci
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
