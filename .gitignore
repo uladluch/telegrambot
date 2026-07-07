@@ -1,0 +1,3 @@
+# Никогда не коммитить куки/секреты, которые может создать scripts/dia_cookies.py
+*cookies*.txt
+*.cookies
