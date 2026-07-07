@@ -228,7 +228,8 @@ async function isYoutubeShort(videoId: string): Promise<boolean> {
 }
 
 // Карточка YouTube-видео: Telegram сам развернёт превью из ссылки, снизу — кнопки.
-// callback_data: "v:<videoId>" (видео) / "a:<videoId>" (аудио).
+// Верхний ряд — оригинал: "v:<videoId>" (видео) / "a:<videoId>" (аудио).
+// Нижний ряд — русская закадровая озвучка (Яндекс): "rv:" (видео) / "ra:" (аудио).
 async function youtubeCard(chatId: string, ep: Episode, feedTitle: string) {
   const url = ep.link ?? `https://www.youtube.com/watch?v=${ep.guid}`;
   const date = fmtDate(ep.pubDate);
@@ -238,10 +239,16 @@ async function youtubeCard(chatId: string, ep: Episode, feedTitle: string) {
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
     reply_markup: {
-      inline_keyboard: [[
-        { text: "⬇️ Видео", callback_data: `v:${ep.guid}` },
-        { text: "🎧 Аудио", callback_data: `a:${ep.guid}` },
-      ]],
+      inline_keyboard: [
+        [
+          { text: "⬇️ Видео", callback_data: `v:${ep.guid}` },
+          { text: "🎧 Аудио", callback_data: `a:${ep.guid}` },
+        ],
+        [
+          { text: "🎬 RU", callback_data: `rv:${ep.guid}` },
+          { text: "🎧 RU", callback_data: `ra:${ep.guid}` },
+        ],
+      ],
     },
   });
 }
@@ -302,7 +309,7 @@ const HELP = `<b>Команды:</b>
 /clear — очистить переписку с ботом (подписки не трогает)
 /help — справка
 
-Ничего не приходит само — эпизоды запрашиваешь через /latest или /last5. На карточке жмёшь кнопку, и бот присылает файл (видео до 2 ГБ). Свои эпизоды храни у себя — на сервере ничего не остаётся.`;
+Ничего не приходит само — эпизоды запрашиваешь через /latest или /last5. На карточке жмёшь кнопку, и бот присылает файл (видео до 2 ГБ). На YouTube-карточке есть ещё ряд «🎬 RU» / «🎧 RU» — русская закадровая озвучка через Яндекс (перевод идёт на серверах Яндекса, занимает пару минут). Свои эпизоды храни у себя — на сервере ничего не остаётся.`;
 
 async function getOwner(): Promise<string | null> {
   const { data } = await db.from("bot_state").select("value").eq("key", "owner_chat_id").maybeSingle();
@@ -470,16 +477,23 @@ async function handleCallback(cbq: Record<string, any>) {
   const owner = await getOwner();
   const parts = (cbq.data ?? "").split(":");
   const kind = parts[0];
-  if (chatId !== owner || !["v", "a", "pd"].includes(kind)) {
+  // v/a — оригинал, rv/ra — русская озвучка (Яндекс), pd — эпизод подкаста
+  const YT_JOBS: Record<string, { type: string; note: string }> = {
+    v: { type: "yt_video", note: "Качаю видео" },
+    a: { type: "yt_audio", note: "Качаю аудио" },
+    rv: { type: "yt_video_ru", note: "Перевожу видео на русский" },
+    ra: { type: "yt_audio_ru", note: "Перевожу аудио на русский" },
+  };
+  if (chatId !== owner || !(YT_JOBS[kind] || kind === "pd")) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
     return;
   }
   try {
     let note: string;
-    if (kind === "v" || kind === "a") {
+    if (YT_JOBS[kind]) {
       const url = `https://www.youtube.com/watch?v=${parts[1]}`;
-      await enqueue(kind === "v" ? "yt_video" : "yt_audio", { chat_id: chatId, url });
-      note = kind === "v" ? "Качаю видео" : "Качаю аудио";
+      await enqueue(YT_JOBS[kind].type, { chat_id: chatId, url });
+      note = YT_JOBS[kind].note;
     } else {
       // pd:<subId>:<idx> — эпизод подкаста
       const { data: sub } = await db.from("subscriptions").select("*").eq("id", Number(parts[1])).maybeSingle();
@@ -497,7 +511,11 @@ async function handleCallback(cbq: Record<string, any>) {
       message_id: cbq.message.message_id,
       reply_markup: { inline_keyboard: [] },
     }).catch(() => {});
-    if (kind !== "pd") await say(chatId, `⏳ ${note} — пришлю файлом, когда скачается`);
+    if (kind === "rv" || kind === "ra") {
+      await say(chatId, `⏳ ${note} — Яндекс переводит на своих серверах, это займёт несколько минут`);
+    } else if (kind !== "pd") {
+      await say(chatId, `⏳ ${note} — пришлю файлом, когда скачается`);
+    }
   } catch (e) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Ошибка, см. чат" }).catch(() => {});
     await say(chatId, `⚠️ Ошибка: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
