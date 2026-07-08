@@ -5,7 +5,6 @@
 //  кнопки на карточке — скачать видео/аудио/озвучку, подписаться на канал
 //  (скачивание уходит заданием воркеру); голая YouTube-ссылка → карточка
 //  /digest on|off   — ежедневный текстовый дайджест (07:00 UTC, только карточки)
-//  /clear           — удалить переписку с ботом (подписки не трогает)
 //
 // Архитектура:
 //  - эта функция — "мозг": команды, подписки, очередь заданий;
@@ -373,7 +372,6 @@ const HELP = `<b>Commands:</b>
 /del — unsubscribe
 /digest on|off — daily digest of new episodes (07:00 UTC)
 /status — download queue and recent errors
-/clear — wipe this chat (subscriptions stay)
 /help — this help
 
 Just send (or forward) a YouTube link — you'll get a card with buttons (up to 480p, files up to 2 GB). 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), ➕ Subscribe — appears when you're not subscribed to the video's channel. 👀 on your message means I'm on it; it turns 👍 when the file is sent. Nothing is stored on the server — keep your files in the chat.`;
@@ -389,7 +387,6 @@ async function registerCommands() {
       { command: "del", description: "Unsubscribe (buttons)" },
       { command: "digest", description: "Daily digest on/off (07:00 UTC)" },
       { command: "status", description: "Download queue and recent errors" },
-      { command: "clear", description: "Wipe this chat (subscriptions stay)" },
       { command: "help", description: "Help and tips" },
     ],
   }).catch(() => {});
@@ -635,18 +632,6 @@ async function cmdStatus(chatId: string) {
   await say(chatId, lines.join("\n"));
 }
 
-// /clear — удаляет сообщения бота в чате (диапазоном id). Подписки и данные не трогает.
-// Telegram даёт удалять сообщения бота только за последние 48 часов, остальное молча пропустится.
-async function cmdClear(chatId: string, upToMsgId: number) {
-  const { data } = await db.from("bot_state").select("value").eq("key", "clear_floor").maybeSingle();
-  const floor = Number(data?.value ?? 0);
-  const start = Math.max(floor + 1, upToMsgId - 400);
-  for (let id = start; id <= upToMsgId; id++) {
-    await tg("deleteMessage", { chat_id: chatId, message_id: id }).catch(() => {});
-  }
-  await db.from("bot_state").upsert({ key: "clear_floor", value: String(upToMsgId) });
-}
-
 // ---------- Cron (pg_cron → сюда с x-cron-secret) ----------
 
 async function handleCron(task: string) {
@@ -883,9 +868,6 @@ async function handleUpdate(update: Record<string, any>) {
         break;
       case "/status":
         await cmdStatus(chatId);
-        break;
-      case "/clear":
-        await cmdClear(chatId, msg.message_id);
         break;
       default:
         await say(chatId, "Unknown command.\n\n" + HELP);
