@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -395,11 +396,20 @@ RU_TAG = "🔊 Russian voice-over (Yandex)"
 
 
 def do_youtube_audio_ru(p, tmp):
-    st = Status(p["chat_id"], "🔊 Requesting Russian voice-over from Yandex… this may take a few minutes")
+    # Перевод у Яндекса кэшируется глобально: популярные видео отдаются мгновенно,
+    # долгий путь — только у видео, которое никто ещё не переводил.
+    st = Status(p["chat_id"], "🔊 Requesting Russian voice-over from Yandex…")
     try:
-        ru = vot_translate_audio(p["url"], tmp, p.get("lang", "auto"))
+        # Метаданные тянем параллельно с переводом — на кэшированных переводах
+        # это почти всё время задания
+        ex = ThreadPoolExecutor(max_workers=1)
+        meta_f = ex.submit(ytdlp_meta, p["url"])
+        try:
+            ru = vot_translate_audio(p["url"], tmp, p.get("lang", "auto"))
+            info = meta_f.result()
+        finally:
+            ex.shutdown(wait=False)
         check_size(ru)
-        info = ytdlp_meta(p["url"])
         cap = yt_caption(p, info, extra=RU_TAG)
         title = (info.get("title") or "audio")[:64]
         channel = (info.get("channel") or info.get("uploader") or "")[:64]
@@ -414,12 +424,21 @@ def do_youtube_audio_ru(p, tmp):
 
 
 def do_youtube_video_ru(p, tmp):
-    st = Status(p["chat_id"], "⏳ Downloading video…")
+    st = Status(p["chat_id"], "⏳ Downloading video + requesting the Russian dub…")
     try:
-        info, vf = run_ytdlp(p["url"], tmp, audio_only=False,
-                             on_progress=lambda pct: st.edit(f"⏳ Downloading video… {pct}"))
-        st.edit("🔊 Requesting Russian voice-over from Yandex… this may take a few minutes", force=True)
-        ru = vot_translate_audio(p["url"], tmp, p.get("lang", "auto"))
+        # Перевод запрашиваем параллельно со скачиванием видео: на кэшированных
+        # у Яндекса роликах дорожка готова раньше, чем докачается видео,
+        # и её время полностью прячется за загрузкой.
+        ex = ThreadPoolExecutor(max_workers=1)
+        vot_f = ex.submit(vot_translate_audio, p["url"], tmp, p.get("lang", "auto"))
+        try:
+            info, vf = run_ytdlp(p["url"], tmp, audio_only=False,
+                                 on_progress=lambda pct: st.edit(f"⏳ Downloading video… {pct}"))
+            if not vot_f.done():
+                st.edit("🔊 Waiting for the Russian dub from Yandex… this may take a few minutes", force=True)
+            ru = vot_f.result()
+        finally:
+            ex.shutdown(wait=False)
         st.edit("🎛 Mixing the Russian track into the video…", force=True)
         title = (info.get("title") or "video")[:64]
         channel = (info.get("channel") or info.get("uploader") or "")[:64]
