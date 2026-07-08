@@ -297,24 +297,34 @@ async function videoChannelId(videoId: string): Promise<string | null> {
 }
 
 // Карточка для присланной напрямую ссылки на YouTube — без команды и подписки.
-// Язык видео неизвестен, поэтому RU-ряд показываем всегда. Если на канал видео
-// ещё не подписаны — снизу кнопка подписки во всю ширину (sub:<channelId>).
+// Язык видео неизвестен, поэтому RU-ряд показываем всегда. Карточку с кнопками
+// скачивания шлём сразу, а кнопку подписки (sub:<channelId>) дорисовываем вторым
+// шагом — определение канала не должно задерживать самый частый сценарий.
 async function linkCard(chatId: string, videoId: string) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const rows = ytKeyboard(videoId, true);
-  const ch = await videoChannelId(videoId);
-  if (ch) {
-    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${ch}`;
-    const { data } = await db.from("subscriptions").select("id").eq("feed_url", feedUrl).maybeSingle();
-    if (!data) rows.push([{ text: "➕ Subscribe to this channel", callback_data: `sub:${ch}` }]);
-  }
-  await tg("sendMessage", {
+  const sent = await tg("sendMessage", {
     chat_id: chatId,
     text: esc(url),
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
     reply_markup: { inline_keyboard: rows },
   });
+  try {
+    const ch = await videoChannelId(videoId);
+    if (!ch) return;
+    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${ch}`;
+    const { data } = await db.from("subscriptions").select("id").eq("feed_url", feedUrl).maybeSingle();
+    if (data) return; // уже подписан — кнопка не нужна
+    rows.push([{ text: "➕ Subscribe to this channel", callback_data: `sub:${ch}` }]);
+    await tg("editMessageReplyMarkup", {
+      chat_id: chatId,
+      message_id: sent.message_id,
+      reply_markup: { inline_keyboard: rows },
+    }).catch(() => {});
+  } catch {
+    // канал не определился — оставляем карточку без кнопки подписки
+  }
 }
 
 // Карточка эпизода подкаста с кнопкой скачивания.
@@ -341,9 +351,46 @@ async function renderCard(chatId: string, sub: Sub, ep: Episode, feedTitle: stri
   else await podcastCard(chatId, sub, ep, idx);
 }
 
+// Параллельный map с ограничением одновременных задач (чтобы не завалить YouTube пачкой HEAD).
+async function mapPool<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>): Promise<R[]> {
+  const res: R[] = new Array(items.length);
+  let i = 0;
+  async function run() {
+    while (i < items.length) {
+      const idx = i++;
+      res[idx] = await fn(items[idx]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return res;
+}
+
+// Возвращает множество видео-id, которые являются shorts. Статус вечен, поэтому
+// читаем кэш из youtube_meta одним запросом, а YouTube спрашиваем только про новые.
+async function filterShorts(ids: string[]): Promise<Set<string>> {
+  const shorts = new Set<string>();
+  if (!ids.length) return shorts;
+  const { data } = await db.from("youtube_meta").select("video_id, is_short").in("video_id", ids);
+  const cached = new Map<string, boolean>((data ?? []).map((r) => [r.video_id, r.is_short]));
+  for (const [id, isShort] of cached) if (isShort) shorts.add(id);
+  const unknown = ids.filter((id) => !cached.has(id));
+  if (unknown.length) {
+    const checked = await mapPool(unknown, 8, async (id) => ({ id, short: await isYoutubeShort(id) }));
+    await db.from("youtube_meta")
+      .upsert(checked.map((c) => ({ video_id: c.id, is_short: c.short })), {
+        onConflict: "video_id",
+        ignoreDuplicates: true,
+      })
+      .then(() => {}, () => {});
+    for (const c of checked) if (c.short) shorts.add(c.id);
+  }
+  return shorts;
+}
+
 // Собирает до max видимых эпизодов (для youtube пропускает shorts), новейший → старый.
 // keep(ep) === false прерывает сбор — список отсортирован по дате, дальше только старее.
-// offset пропускает первые N подходящих — для кнопки "5 more".
+// offset пропускает первые N видимых — для кнопки "5 more". Shorts-статус берётся из кэша
+// пачкой (см. filterShorts), поэтому сканируем с запасом и фильтруем разом.
 async function collectEpisodes(
   sub: Sub,
   episodes: Episode[],
@@ -351,16 +398,18 @@ async function collectEpisodes(
   max: number,
   offset = 0,
 ): Promise<{ ep: Episode; idx: number }[]> {
-  const out: { ep: Episode; idx: number }[] = [];
-  let seen = 0;
-  for (let i = 0; i < episodes.length && out.length < max; i++) {
-    const ep = episodes[i];
-    if (!keep(ep)) break;
-    if (sub.kind === "youtube" && (await isYoutubeShort(ep.guid))) continue;
-    if (seen++ < offset) continue;
-    out.push({ ep, idx: i });
+  const scanLimit = offset + max * 4 + 20; // запас на отсеиваемые shorts
+  const candidates: { ep: Episode; idx: number }[] = [];
+  for (let i = 0; i < episodes.length && candidates.length < scanLimit; i++) {
+    if (!keep(episodes[i])) break;
+    candidates.push({ ep: episodes[i], idx: i });
   }
-  return out;
+  let visible = candidates;
+  if (sub.kind === "youtube") {
+    const shorts = await filterShorts(candidates.map((c) => c.ep.guid));
+    visible = candidates.filter((c) => !shorts.has(c.ep.guid));
+  }
+  return visible.slice(offset, offset + max);
 }
 
 // ---------- Команды ----------
@@ -523,8 +572,8 @@ async function cmdLatestAll(chatId: string, digest = false) {
     return;
   }
   const cutoff = Date.now() - DAY_MS;
-  const items: { sub: Sub; ep: Episode; feedTitle: string; idx: number }[] = [];
-  for (const sub of subs as Sub[]) {
+  // Фиды тянем параллельно — 7 подписок за время одного запроса, а не семи подряд
+  const perSub = await Promise.all((subs as Sub[]).map(async (sub) => {
     try {
       const feed = await fetchFeed(sub.feed_url);
       const picked = await collectEpisodes(
@@ -533,14 +582,16 @@ async function cmdLatestAll(chatId: string, digest = false) {
         (ep) => (Date.parse(ep.pubDate ?? "") || 0) >= cutoff,
         50,
       );
-      // Старые → новые, чтобы самый свежий оказался внизу чата
-      for (let j = picked.length - 1; j >= 0; j--) {
-        items.push({ sub, ep: picked[j].ep, feedTitle: feed.title, idx: picked[j].idx });
-      }
+      return picked.map((p) => ({ sub, ep: p.ep, feedTitle: feed.title, idx: p.idx }));
     } catch (e) {
       console.error(`latest failed for ${sub.feed_url}`, e);
+      return [];
     }
-  }
+  }));
+  // Единый список всех подписок, отсортированный по дате: старые → новые,
+  // чтобы самый свежий эпизод оказался внизу чата по всему дайджесту, а не по каждой подписке
+  const items = perSub.flat();
+  items.sort((a, b) => (Date.parse(a.ep.pubDate ?? "") || 0) - (Date.parse(b.ep.pubDate ?? "") || 0));
   if (!items.length) {
     if (!digest) await say(chatId, "No new episodes in the last 24 hours");
     return;
@@ -637,16 +688,22 @@ async function handleCron(task: string) {
     const owner = await getOwner();
     if (!owner) return;
 
-    // Watchdog: задания, висящие в running дольше 2 часов, помечаем ошибкой
+    // Watchdog (каждые 15 мин): задания, зависшие в running, помечаем ошибкой.
+    // Порог по типу: RU-озвучка у Яндекса легально идёт до полутора часов,
+    // обычное скачивание в норме — секунды-минуты, поэтому его хороним быстрее.
     if (task === "watchdog") {
-      const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-      const { data } = await db.from("jobs")
-        .update({ status: "error", error: "timed out — killed by watchdog", updated_at: new Date().toISOString() })
-        .eq("status", "running")
-        .lt("updated_at", cutoff)
-        .select();
-      if (data?.length) {
-        await say(owner, `⚠️ ${data.length} stuck download(s) (running over 2h) marked as failed — see /status`);
+      const SLOW = ["yt_video_ru", "yt_audio_ru"];
+      const now = Date.now();
+      const { data: running } = await db.from("jobs").select("id, type, updated_at").eq("status", "running");
+      const stuck = (running ?? []).filter((j) => {
+        const age = now - Date.parse(j.updated_at);
+        return age > (SLOW.includes(j.type) ? 90 * 60 * 1000 : 20 * 60 * 1000);
+      });
+      if (stuck.length) {
+        await db.from("jobs")
+          .update({ status: "error", error: "timed out — killed by watchdog", updated_at: new Date().toISOString() })
+          .in("id", stuck.map((j) => j.id));
+        await say(owner, `⚠️ ${stuck.length} stuck download(s) marked as failed — see /status`);
       }
       return;
     }

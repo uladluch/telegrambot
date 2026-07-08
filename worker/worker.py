@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -451,57 +452,100 @@ HANDLERS = {
 }
 
 
+# Несколько потоков: длинная RU-озвучка (минуты) не блокирует быстрые скачивания.
+# claim в edge атомарный (UPDATE ... WHERE status='pending'), так что гонок нет.
+WORKERS = int(os.environ.get("WORKERS", "2"))
+_shutdown = threading.Event()
+_active: dict = {}  # job_id -> payload — что сейчас в работе (для пометки при рестарте)
+_active_lock = threading.Lock()
+
+
+def process_job(job):
+    p = job["payload"]
+    print(f"job {job['id']} ({job['type']}): {p.get('url', '')[:120]}", flush=True)
+    # «Отправляет видео/файл…» вверху чата на всё время задания
+    action = "upload_video" if job["type"] in ("yt_video", "yt_video_ru") else "upload_document"
+    pinger = ActionPinger(p["chat_id"], action) if p.get("chat_id") else None
+    ok, err = True, None
+    try:
+        handler = HANDLERS.get(job["type"])
+        if not handler:
+            raise RuntimeError(f"unknown job type: {job['type']}")
+        with tempfile.TemporaryDirectory() as td:
+            handler(p, pathlib.Path(td))
+    except Exception as e:
+        ok, err = False, str(e)[:500]
+        print(f"job {job['id']} failed: {err}", flush=True)
+        fallback = f'\n<a href="{p["url"]}">Source link</a>' if p.get("url") else ""
+        notify(p.get("chat_id"), f"⚠️ Failed: {html.escape(err)}{fallback}")
+        # 👀 «принял» на исходном сообщении меняем на 😢
+        if p.get("ack_message_id"):
+            react(p.get("chat_id"), p["ack_message_id"], "😢")
+    else:
+        print(f"job {job['id']} done", flush=True)
+        # 👀 → 👍: файл отправлен
+        if p.get("ack_message_id"):
+            react(p.get("chat_id"), p["ack_message_id"], "👍")
+    finally:
+        if pinger:
+            pinger.close()
+
+    try:
+        edge("complete", id=job["id"], ok=ok, error=err)
+    except Exception as e:
+        print("complete failed:", e, flush=True)
+
+
+def worker_loop(idx):
+    while not _shutdown.is_set():
+        try:
+            job = edge("claim").get("job")
+        except Exception as e:
+            print(f"[{idx}] claim failed:", e, flush=True)
+            _shutdown.wait(POLL_SECONDS)
+            continue
+        if not job:
+            _shutdown.wait(POLL_SECONDS)
+            continue
+        with _active_lock:
+            _active[job["id"]] = job["payload"]
+        try:
+            process_job(job)
+        finally:
+            with _active_lock:
+                _active.pop(job["id"], None)
+
+
+def on_sigterm(signum, frame):
+    # Railway шлёт SIGTERM перед рестартом/редеплоем. Помечаем всё, что в работе,
+    # ошибкой сами — иначе задание зависнет в running до watchdog. Успеть бы за
+    # grace period, поэтому только быстрые вызовы; watchdog подстрахует остальное.
+    _shutdown.set()
+    with _active_lock:
+        items = list(_active.items())
+    for jid, p in items:
+        try:
+            edge("complete", id=jid, ok=False, error="worker restarted mid-job — tap the button again")
+        except Exception:
+            pass
+        if p.get("ack_message_id"):
+            react(p.get("chat_id"), p["ack_message_id"], "😢")
+        notify(p.get("chat_id"), "⚠️ The worker restarted mid-download — tap the button again to retry")
+
+
 def main():
+    signal.signal(signal.SIGTERM, on_sigterm)
     try:
         dv = subprocess.run(["deno", "--version"], capture_output=True, text=True).stdout.splitlines()[:1]
         print(f"deno: {dv}", flush=True)
     except Exception as e:
         print(f"deno missing: {e}", flush=True)
-    print(f"worker started, bot-api: {BOT_API}", flush=True)
-    while True:
-        try:
-            job = edge("claim").get("job")
-        except Exception as e:
-            print("claim failed:", e, flush=True)
-            time.sleep(POLL_SECONDS)
-            continue
-        if not job:
-            time.sleep(POLL_SECONDS)
-            continue
-
-        p = job["payload"]
-        print(f"job {job['id']} ({job['type']}): {p.get('url', '')[:120]}", flush=True)
-        # «Отправляет видео/файл…» вверху чата на всё время задания
-        action = "upload_video" if job["type"] in ("yt_video", "yt_video_ru") else "upload_document"
-        pinger = ActionPinger(p["chat_id"], action) if p.get("chat_id") else None
-        ok, err = True, None
-        try:
-            handler = HANDLERS.get(job["type"])
-            if not handler:
-                raise RuntimeError(f"unknown job type: {job['type']}")
-            with tempfile.TemporaryDirectory() as td:
-                handler(p, pathlib.Path(td))
-        except Exception as e:
-            ok, err = False, str(e)[:500]
-            print(f"job {job['id']} failed: {err}", flush=True)
-            fallback = f'\n<a href="{p["url"]}">Source link</a>' if p.get("url") else ""
-            notify(p.get("chat_id"), f"⚠️ Failed: {html.escape(err)}{fallback}")
-            # 👀 «принял» на исходном сообщении меняем на 😢
-            if p.get("ack_message_id"):
-                react(p.get("chat_id"), p["ack_message_id"], "😢")
-        else:
-            print(f"job {job['id']} done", flush=True)
-            # 👀 → 👍: файл отправлен
-            if p.get("ack_message_id"):
-                react(p.get("chat_id"), p["ack_message_id"], "👍")
-        finally:
-            if pinger:
-                pinger.close()
-
-        try:
-            edge("complete", id=job["id"], ok=ok, error=err)
-        except Exception as e:
-            print("complete failed:", e, flush=True)
+    print(f"worker started ({WORKERS} workers), bot-api: {BOT_API}", flush=True)
+    threads = [threading.Thread(target=worker_loop, args=(i,), daemon=True) for i in range(WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 if __name__ == "__main__":
