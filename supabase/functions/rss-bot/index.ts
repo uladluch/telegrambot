@@ -1,8 +1,7 @@
 // Личный Telegram-бот: подписки на RSS подкастов и YouTube-каналы.
 // Интерфейс английский. Файлы не качаются сами — всё по запросу:
 //  /latest          — эпизоды всех подписок за последние сутки (карточки с кнопками)
-//  /list            — подписки кнопками (тап → 5 последних эпизодов)
-//  /last5 /last10 N — N последних эпизодов конкретной подписки
+//  /list            — подписки кнопками (тап → последний эпизод, дальше «⬇️ 5 more»)
 //  кнопки на карточке — скачать видео/аудио/озвучку/субтитры (задание уходит воркеру)
 //  /digest on|off   — ежедневный текстовый дайджест (07:00 UTC, только карточки)
 //  /clear           — удалить переписку с ботом (подписки не трогает)
@@ -350,8 +349,7 @@ async function collectEpisodes(
 
 const HELP = `<b>Commands:</b>
 /latest — new episodes from all subscriptions (last 24h)
-/list — subscriptions as buttons: tap one for its last 5 episodes
-/last5 /last10 N — recent episodes of subscription N
+/list — subscriptions as buttons: tap one for its latest episode
 /add link or name — podcast or YouTube channel
 /del — unsubscribe
 /video link — download a YouTube video (up to 480p)
@@ -362,6 +360,25 @@ const HELP = `<b>Commands:</b>
 /help — this help
 
 Easiest way: just send (or forward) a YouTube link — you'll get a card with buttons. 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), 📝 Subs — subtitles file. 👀 on your message means I'm on it; it turns 👍 when the file is sent. Files up to 2 GB. Nothing is stored on the server — keep your files in the chat.`;
+
+// Меню команд Telegram (кнопка «/» у поля ввода) — команды тапаются, а не
+// вводятся руками. Идемпотентно, обновляем при /start и /help.
+async function registerCommands() {
+  await tg("setMyCommands", {
+    commands: [
+      { command: "latest", description: "New episodes from all subscriptions (24h)" },
+      { command: "list", description: "Subscriptions — tap one for its latest episode" },
+      { command: "add", description: "Subscribe: /add link or name" },
+      { command: "del", description: "Unsubscribe (buttons)" },
+      { command: "video", description: "Download a YouTube video: /video link" },
+      { command: "audio", description: "Extract audio: /audio link" },
+      { command: "digest", description: "Daily digest on/off (07:00 UTC)" },
+      { command: "status", description: "Download queue and recent errors" },
+      { command: "clear", description: "Wipe this chat (subscriptions stay)" },
+      { command: "help", description: "Help and tips" },
+    ],
+  }).catch(() => {});
+}
 
 async function getOwner(): Promise<string | null> {
   const { data } = await db.from("bot_state").select("value").eq("key", "owner_chat_id").maybeSingle();
@@ -434,7 +451,7 @@ async function cmdAdd(chatId: string, arg: string) {
     chatId,
     `✅ Subscribed: <b>${esc(feed.title)}</b> (#${sub.id}, ${kind === "youtube" ? "YouTube" : "podcast"})\n` +
       (latest ? `Latest: ${esc(latest.title)} (${fmtDate(latest.pubDate)})\n` : "") +
-      `Browse it: <code>/last5 ${sub.id}</code>`,
+      `Browse it via /list`,
   );
 }
 
@@ -442,7 +459,7 @@ function subButtonLabel(s: Sub) {
   return `#${s.id} ${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`;
 }
 
-// Каждая подписка — кнопка: тап → 5 последних эпизодов. Номера помнить не нужно.
+// Каждая подписка — кнопка: тап → последний эпизод, глубже — через «⬇️ 5 more».
 async function cmdList(chatId: string) {
   const { data: subs } = await db.from("subscriptions").select("*").order("id");
   if (!subs?.length) {
@@ -452,7 +469,7 @@ async function cmdList(chatId: string) {
   const rows = (subs as Sub[]).map((s) => [{ text: subButtonLabel(s), callback_data: `l5:${s.id}` }]);
   await tg("sendMessage", {
     chat_id: chatId,
-    text: "<b>Subscriptions</b> — tap one to get its last 5 episodes:",
+    text: "<b>Subscriptions</b> — tap one to get its latest episode:",
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: rows },
   });
@@ -522,11 +539,11 @@ async function cmdLatestAll(chatId: string, digest = false) {
   for (const it of items) await renderCard(chatId, it.sub, it.ep, it.feedTitle, it.idx);
 }
 
-// /last5, /last10 и кнопки из /list — N эпизодов подписки карточками, с пагинацией
+// Кнопки из /list — N эпизодов подписки карточками, с пагинацией
 async function cmdLast(chatId: string, arg: string, n: number, offset = 0) {
   const id = Number(arg.replace("#", ""));
   if (!id) {
-    await say(chatId, `Usage: <code>/last${n} N</code> (number from /list)`);
+    await say(chatId, "Pick a subscription via /list");
     return;
   }
   const { data: sub } = await db.from("subscriptions").select("*").eq("id", id).maybeSingle();
@@ -667,8 +684,9 @@ async function handleCallback(cbq: Record<string, any>) {
     return;
   }
   try {
-    // l5:<subId>[:offset] — эпизоды подписки. Кнопки /list не трогаем (список
-    // остаётся рабочим), а вот кнопку "5 more" убираем, чтобы не дублировать.
+    // l5:<subId> — тап по каналу в /list: только последний эпизод.
+    // l5:<subId>:<offset> — кнопка «⬇️ 5 more»: следующая пятёрка; саму кнопку
+    // убираем, чтобы не дублировать. Кнопки /list не трогаем — список остаётся рабочим.
     if (kind === "l5") {
       await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Fetching episodes…" }).catch(() => {});
       if (parts.length >= 3) {
@@ -677,8 +695,10 @@ async function handleCallback(cbq: Record<string, any>) {
           message_id: cbq.message.message_id,
           reply_markup: { inline_keyboard: [] },
         }).catch(() => {});
+        await cmdLast(chatId, parts[1], 5, Number(parts[2]));
+      } else {
+        await cmdLast(chatId, parts[1], 1, 0);
       }
-      await cmdLast(chatId, parts[1], 5, Number(parts[2] ?? 0));
       return;
     }
 
@@ -801,6 +821,7 @@ async function handleUpdate(update: Record<string, any>) {
     switch (cmd.split("@")[0].toLowerCase()) {
       case "/start":
       case "/help":
+        await registerCommands();
         await say(chatId, HELP);
         break;
       case "/add":
@@ -818,12 +839,6 @@ async function handleUpdate(update: Record<string, any>) {
         await react(chatId, msg.message_id, "👀");
         await chatAction(chatId);
         await cmdLatestAll(chatId);
-        break;
-      case "/last5":
-        await cmdLast(chatId, arg, 5);
-        break;
-      case "/last10":
-        await cmdLast(chatId, arg, 10);
         break;
       case "/video":
       case "/audio": {

@@ -22,7 +22,9 @@ WORKER_SECRET = os.environ["WORKER_SECRET"]
 BOT_API = os.environ.get("BOT_API_URL", "http://bot-api.railway.internal:8081")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API = f"{BOT_API}/bot{BOT_TOKEN}"
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
+# 10 с: ~260 тыс. вызовов edge в месяц — глубоко в бесплатном лимите Supabase,
+# зато задание стартует почти сразу после нажатия кнопки
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
 TG_MAX = 1_950_000_000  # self-hosted bot-api пускает до 2000 МБ
 
 # Перевод на серверах Яндекса асинхронный, vot-cli сам поллит — таймаут щедрый:
@@ -346,12 +348,17 @@ def do_youtube_audio_ru(p, tmp):
     # это почти всё время задания.
     ex = ThreadPoolExecutor(max_workers=1)
     meta_f = ex.submit(ytdlp_meta, p["url"])
+    t0 = time.monotonic()
     try:
         ru = vot_translate_audio(p["url"], tmp, p.get("lang", "auto"))
         info = meta_f.result()
     finally:
         ex.shutdown(wait=False)
     check_size(ru)
+    # Тайминги фаз в лог: где именно тонут минуты на длинных подкастах
+    t1 = time.monotonic()
+    print(f"audio_ru: translate+fetch {t1 - t0:.0f}s, "
+          f"file {ru.stat().st_size // 1_048_576} MB", flush=True)
     cap = yt_caption(p, info, extra=RU_TAG)
     title = (info.get("title") or "audio")[:64]
     channel = (info.get("channel") or info.get("uploader") or "")[:64]
@@ -360,6 +367,7 @@ def do_youtube_audio_ru(p, tmp):
            chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
            title=title, performer=channel,
            duration=int(info.get("duration") or probe_duration(ru)))
+    print(f"audio_ru: upload {time.monotonic() - t1:.0f}s", flush=True)
 
 
 def do_youtube_video_ru(p, tmp):
