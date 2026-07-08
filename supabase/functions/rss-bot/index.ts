@@ -685,7 +685,8 @@ async function handleCallback(cbq: Record<string, any>) {
   const parts = (cbq.data ?? "").split(":");
   const kind = parts[0];
   // v/a — оригинал, rv/ra — русская озвучка (Яндекс), s — субтитры, pd — эпизод
-  // подкаста, l5 — страница эпизодов из /list, del/delok/delno — отписка
+  // подкаста, l5 — страница эпизодов из /list, del/delok/delno — отписка,
+  // sub — подписка на канал с карточки видео
   const YT_JOBS: Record<string, { type: string; note: string }> = {
     v: { type: "yt_video", note: "Downloading video" },
     a: { type: "yt_audio", note: "Downloading audio" },
