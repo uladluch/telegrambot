@@ -2,7 +2,8 @@
 // Интерфейс английский. Файлы не качаются сами — всё по запросу:
 //  /latest          — эпизоды всех подписок за последние сутки (карточки с кнопками)
 //  /list            — подписки кнопками (тап → последний эпизод, дальше «⬇️ 5 more»)
-//  кнопки на карточке — скачать видео/аудио/озвучку/субтитры (задание уходит воркеру)
+//  кнопки на карточке — скачать видео/аудио/озвучку, подписаться на канал
+//  (скачивание уходит заданием воркеру); голая YouTube-ссылка → карточка
 //  /digest on|off   — ежедневный текстовый дайджест (07:00 UTC, только карточки)
 //  /clear           — удалить переписку с ботом (подписки не трогает)
 //
@@ -250,8 +251,9 @@ function hasCyrillic(s: string) {
 }
 
 // Клавиатура YouTube-карточки. С RU-рядом кнопки оригинала подписаны EN,
-// без него (русскоязычный канал) — нейтральные Video/Audio. Плюс субтитры.
-// v/a — оригинал, rv/ra — русская озвучка (Яндекс), s — субтитры.
+// без него (русскоязычный канал) — нейтральные Video/Audio.
+// v/a — оригинал, rv/ra — русская озвучка (Яндекс). Колбэк субтитров (s:)
+// в обработчике жив, но кнопку не показываем — вернём, когда понадобится.
 function ytKeyboard(videoId: string, withRu: boolean) {
   const original = withRu
     ? [
@@ -269,7 +271,6 @@ function ytKeyboard(videoId: string, withRu: boolean) {
       { text: "🎧 RU", callback_data: `ra:${videoId}` },
     ]);
   }
-  rows.push([{ text: "📝 Subs", callback_data: `s:${videoId}` }]);
   return rows;
 }
 
@@ -286,16 +287,34 @@ async function youtubeCard(chatId: string, ep: Episode, feedTitle: string) {
   });
 }
 
+// Канал присланного видео: тянем страницу ролика и достаём channelId из HTML.
+// Провал не критичен — просто не покажем кнопку подписки.
+async function videoChannelId(videoId: string): Promise<string | null> {
+  try {
+    return await resolveYoutubeChannelId(`https://www.youtube.com/watch?v=${videoId}`);
+  } catch {
+    return null;
+  }
+}
+
 // Карточка для присланной напрямую ссылки на YouTube — без команды и подписки.
-// Язык видео неизвестен, поэтому RU-ряд показываем всегда.
+// Язык видео неизвестен, поэтому RU-ряд показываем всегда. Если на канал видео
+// ещё не подписаны — снизу кнопка подписки во всю ширину (sub:<channelId>).
 async function linkCard(chatId: string, videoId: string) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const rows = ytKeyboard(videoId, true);
+  const ch = await videoChannelId(videoId);
+  if (ch) {
+    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${ch}`;
+    const { data } = await db.from("subscriptions").select("id").eq("feed_url", feedUrl).maybeSingle();
+    if (!data) rows.push([{ text: "➕ Subscribe to this channel", callback_data: `sub:${ch}` }]);
+  }
   await tg("sendMessage", {
     chat_id: chatId,
     text: esc(url),
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
-    reply_markup: { inline_keyboard: ytKeyboard(videoId, true) },
+    reply_markup: { inline_keyboard: rows },
   });
 }
 
@@ -352,14 +371,12 @@ const HELP = `<b>Commands:</b>
 /list — subscriptions as buttons: tap one for its latest episode
 /add link or name — podcast or YouTube channel
 /del — unsubscribe
-/video link — download a YouTube video (up to 480p)
-/audio link — extract audio from a YouTube video
 /digest on|off — daily digest of new episodes (07:00 UTC)
 /status — download queue and recent errors
 /clear — wipe this chat (subscriptions stay)
 /help — this help
 
-Easiest way: just send (or forward) a YouTube link — you'll get a card with buttons. 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), 📝 Subs — subtitles file. 👀 on your message means I'm on it; it turns 👍 when the file is sent. Files up to 2 GB. Nothing is stored on the server — keep your files in the chat.`;
+Just send (or forward) a YouTube link — you'll get a card with buttons (up to 480p, files up to 2 GB). 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), ➕ Subscribe — appears when you're not subscribed to the video's channel. 👀 on your message means I'm on it; it turns 👍 when the file is sent. Nothing is stored on the server — keep your files in the chat.`;
 
 // Меню команд Telegram (кнопка «/» у поля ввода) — команды тапаются, а не
 // вводятся руками. Идемпотентно, обновляем при /start и /help.
@@ -370,8 +387,6 @@ async function registerCommands() {
       { command: "list", description: "Subscriptions — tap one for its latest episode" },
       { command: "add", description: "Subscribe: /add link or name" },
       { command: "del", description: "Unsubscribe (buttons)" },
-      { command: "video", description: "Download a YouTube video: /video link" },
-      { command: "audio", description: "Extract audio: /audio link" },
       { command: "digest", description: "Daily digest on/off (07:00 UTC)" },
       { command: "status", description: "Download queue and recent errors" },
       { command: "clear", description: "Wipe this chat (subscriptions stay)" },
@@ -678,7 +693,7 @@ async function handleCallback(cbq: Record<string, any>) {
     ra: { type: "yt_audio_ru", note: "Translating audio to Russian" },
     s: { type: "yt_subs", note: "Fetching subtitles" },
   };
-  const KNOWN = ["pd", "l5", "del", "delok", "delno"];
+  const KNOWN = ["pd", "l5", "del", "delok", "delno", "sub"];
   if (chatId !== owner || !(YT_JOBS[kind] || KNOWN.includes(kind))) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
     return;
@@ -699,6 +714,28 @@ async function handleCallback(cbq: Record<string, any>) {
       } else {
         await cmdLast(chatId, parts[1], 1, 0);
       }
+      return;
+    }
+
+    // sub:<channelId> — подписка на канал прямо с карточки видео.
+    // Кнопку убираем сразу; при дубле (гонка двух нажатий) просто сообщаем.
+    if (kind === "sub") {
+      await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Subscribing…" }).catch(() => {});
+      const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${parts[1]}`;
+      const feed = await fetchFeed(feedUrl);
+      const { error } = await db.from("subscriptions").insert({ feed_url: feedUrl, title: feed.title, kind: "youtube" });
+      if (error && error.code !== "23505") throw new Error(error.message);
+      const kb = (cbq.message?.reply_markup?.inline_keyboard ?? [])
+        .map((row: Record<string, string>[]) => row.filter((b) => b.callback_data !== cbq.data))
+        .filter((row: Record<string, string>[]) => row.length > 0);
+      await tg("editMessageReplyMarkup", {
+        chat_id: chatId,
+        message_id: cbq.message.message_id,
+        reply_markup: { inline_keyboard: kb },
+      }).catch(() => {});
+      await say(chatId, error
+        ? `Already subscribed to <b>${esc(feed.title)}</b>`
+        : `✅ Subscribed: <b>${esc(feed.title)}</b> — new videos will show up in /latest and /list`);
       return;
     }
 
@@ -840,21 +877,6 @@ async function handleUpdate(update: Record<string, any>) {
         await chatAction(chatId);
         await cmdLatestAll(chatId);
         break;
-      case "/video":
-      case "/audio": {
-        if (!/^https?:\/\//i.test(arg)) {
-          await say(chatId, `Usage: <code>${cmd} video-link</code>`);
-          break;
-        }
-        // 👀 = «взял в работу», воркер по завершении сменит на 👍 (или 😢)
-        await enqueue(cmd === "/video" ? "yt_video" : "yt_audio", {
-          chat_id: chatId,
-          url: arg,
-          ack_message_id: msg.message_id,
-        });
-        await react(chatId, msg.message_id, "👀");
-        break;
-      }
       case "/digest":
         await cmdDigest(chatId, arg);
         break;
