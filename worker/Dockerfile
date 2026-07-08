@@ -10,7 +10,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 # Deno нужен yt-dlp для решения JS-challenge YouTube (иначе «Requested format is not available»)
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
-RUN pip install --no-cache-dir yt-dlp requests
+RUN pip install --no-cache-dir yt-dlp requests realtime
 WORKDIR /app
 COPY worker/worker.py .
 CMD ["python", "-u", "worker.py"]

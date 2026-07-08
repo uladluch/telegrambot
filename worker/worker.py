@@ -23,10 +23,12 @@ WORKER_SECRET = os.environ["WORKER_SECRET"]
 BOT_API = os.environ.get("BOT_API_URL", "http://bot-api.railway.internal:8081")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API = f"{BOT_API}/bot{BOT_TOKEN}"
-# 5 с: задание стартует из простоя быстрее. 2 воркера × ~1М вызовов edge/мес —
-# глубоко в лимите Supabase Pro (2М). Пауза POLL только когда очередь пуста;
-# серия заданий разбирается без задержек.
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))
+# Realtime мгновенно будит воркер на INSERT в jobs (см. realtime_thread). Poll остаётся
+# страховкой на случай разрыва подписки: 30 с в простое — редко, но задание не потеряется.
+# Если Realtime не настроен (нет SUPABASE_URL/KEY) — падаем на быстрый poll (5 с).
+SUPABASE_URL = os.environ.get("SUPABASE_URL")   # https://<ref>.supabase.co
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")   # service_role (обходит RLS для realtime)
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30" if SUPABASE_URL and SUPABASE_KEY else "5"))
 TG_MAX = 1_950_000_000  # self-hosted bot-api пускает до 2000 МБ
 
 # Перевод на серверах Яндекса асинхронный, vot-cli сам поллит — таймаут щедрый:
@@ -478,6 +480,7 @@ HANDLERS = {
 # claim в edge атомарный (UPDATE ... WHERE status='pending'), так что гонок нет.
 WORKERS = int(os.environ.get("WORKERS", "2"))
 _shutdown = threading.Event()
+_wakeup = threading.Event()  # realtime будит спящие воркер-потоки при INSERT в jobs
 _active: dict = {}  # job_id -> payload — что сейчас в работе (для пометки при рестарте)
 _active_lock = threading.Lock()
 
@@ -527,7 +530,9 @@ def worker_loop(idx):
             _shutdown.wait(POLL_SECONDS)
             continue
         if not job:
-            _shutdown.wait(POLL_SECONDS)
+            # Спим до realtime-события (INSERT в jobs) или до таймаута-страховки
+            _wakeup.wait(POLL_SECONDS)
+            _wakeup.clear()
             continue
         with _active_lock:
             _active[job["id"]] = job["payload"]
@@ -543,6 +548,7 @@ def on_sigterm(signum, frame):
     # ошибкой сами — иначе задание зависнет в running до watchdog. Успеть бы за
     # grace period, поэтому только быстрые вызовы; watchdog подстрахует остальное.
     _shutdown.set()
+    _wakeup.set()  # разбудить спящие потоки, чтобы вышли из цикла
     with _active_lock:
         items = list(_active.items())
     for jid, p in items:
@@ -555,6 +561,44 @@ def on_sigterm(signum, frame):
         notify(p.get("chat_id"), "⚠️ The worker restarted mid-download — tap the button again to retry")
 
 
+def realtime_thread():
+    """Подписка на INSERT в jobs через Supabase Realtime (realtime-py): событие
+    мгновенно будит воркер-потоки. Это только «будильник» — claim остаётся атомарным
+    через edge. Poll в worker_loop страхует на случай разрыва подписки (баг reconnect).
+    Соединение переустанавливается в цикле; при отсутствии ключей поток тихо выходит."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        print("realtime: SUPABASE_URL/KEY not set — polling only", flush=True)
+        return
+    import asyncio
+    from realtime import AsyncRealtimeClient
+
+    ws_url = SUPABASE_URL.replace("https://", "wss://").rstrip("/") + "/realtime/v1/websocket"
+
+    async def run():
+        while not _shutdown.is_set():
+            try:
+                client = AsyncRealtimeClient(ws_url, SUPABASE_KEY)
+                await client.connect()
+                channel = client.channel("worker-jobs")
+                channel.on_postgres_changes(
+                    "INSERT", schema="public", table="jobs",
+                    callback=lambda _payload: _wakeup.set(),
+                )
+                await channel.subscribe()
+                print("realtime: subscribed to jobs INSERT", flush=True)
+                # Держим соединение живым; receive-loop крутится в фоне клиента
+                while not _shutdown.is_set():
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print("realtime error, reconnect in 5s:", e, flush=True)
+                await asyncio.sleep(5)
+
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        print("realtime thread stopped:", e, flush=True)
+
+
 def main():
     signal.signal(signal.SIGTERM, on_sigterm)
     try:
@@ -562,7 +606,9 @@ def main():
         print(f"deno: {dv}", flush=True)
     except Exception as e:
         print(f"deno missing: {e}", flush=True)
-    print(f"worker started ({WORKERS} workers), bot-api: {BOT_API}", flush=True)
+    mode = "realtime+poll" if (SUPABASE_URL and SUPABASE_KEY) else "poll only"
+    print(f"worker started ({WORKERS} workers, {mode}), bot-api: {BOT_API}", flush=True)
+    threading.Thread(target=realtime_thread, daemon=True).start()
     threads = [threading.Thread(target=worker_loop, args=(i,), daemon=True) for i in range(WORKERS)]
     for t in threads:
         t.start()
