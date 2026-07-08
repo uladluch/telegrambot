@@ -182,8 +182,50 @@ async function enqueue(type: string, payload: Record<string, unknown>) {
   if (error) throw new Error(`couldn't queue the job: ${error.message}`);
 }
 
-// Скачивает и присылает эпизод подкаста файлом (маленькие — сразу, большие — через воркер)
-async function sendEpisode(chatId: string, ep: Episode, feedTitle: string) {
+// ---------- Кэш file_id ----------
+// Тот же контент, уже загруженный ботом, повторно шлём по file_id — без скачивания
+// и заливки, мгновенно. Ключи: "yt:<videoId>:<v|a|rv|ra>", "pod:<guid>".
+
+type CachedFile = { file_id: string; file_type: string; caption: string | null };
+
+async function cachedFile(cacheKey: string): Promise<CachedFile | null> {
+  const { data } = await db.from("tg_files").select("file_id, file_type, caption").eq("cache_key", cacheKey).maybeSingle();
+  return data ?? null;
+}
+
+async function saveFile(cacheKey: string, fileId: string, fileType: string, caption?: string) {
+  await db.from("tg_files").upsert(
+    { cache_key: cacheKey, file_id: fileId, file_type: fileType, caption: caption ?? null },
+    { onConflict: "cache_key" },
+  );
+}
+
+async function sendCached(chatId: string, f: CachedFile) {
+  const method = f.file_type === "video" ? "sendVideo" : "sendAudio";
+  const payload: Record<string, unknown> = { chat_id: chatId, caption: f.caption ?? "", parse_mode: "HTML" };
+  payload[f.file_type] = f.file_id; // video: <id> / audio: <id>
+  if (f.file_type === "video") payload.supports_streaming = true;
+  await tg(method, payload);
+}
+
+// Мгновенная отдача из кэша по нажатию кнопки: файл + 👍 + снятие нажатой кнопки.
+async function deliverCached(cbq: Record<string, any>, chatId: string, cached: CachedFile) {
+  await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "From cache ⚡" }).catch(() => {});
+  await sendCached(chatId, cached);
+  await react(chatId, cbq.message.message_id, "👍");
+  const kb = (cbq.message?.reply_markup?.inline_keyboard ?? [])
+    .map((row: Record<string, string>[]) => row.filter((b) => b.callback_data !== cbq.data))
+    .filter((row: Record<string, string>[]) => row.length > 0);
+  await tg("editMessageReplyMarkup", {
+    chat_id: chatId,
+    message_id: cbq.message.message_id,
+    reply_markup: { inline_keyboard: kb },
+  }).catch(() => {});
+}
+
+// Скачивает и присылает эпизод подкаста файлом (маленькие — сразу, большие — через воркер).
+// cacheKey задан → маленький файл кэшируем сразу, большой — воркер после заливки.
+async function sendEpisode(chatId: string, ep: Episode, feedTitle: string, cacheKey?: string) {
   if (!ep.audioUrl) {
     await say(chatId, `${podcastCaption(ep, feedTitle)}\n\n⚠️ the feed has no audio file`);
     return;
@@ -197,7 +239,7 @@ async function sendEpisode(chatId: string, ep: Episode, feedTitle: string) {
 
   if (!size || size <= URL_SEND_LIMIT) {
     try {
-      await tg("sendAudio", {
+      const res = await tg("sendAudio", {
         chat_id: chatId,
         audio: ep.audioUrl,
         caption: podcastCaption(ep, feedTitle),
@@ -205,6 +247,9 @@ async function sendEpisode(chatId: string, ep: Episode, feedTitle: string) {
         title: ep.title.slice(0, 64),
         performer: feedTitle.slice(0, 64),
       });
+      if (cacheKey && res?.audio?.file_id) {
+        await saveFile(cacheKey, res.audio.file_id, "audio", podcastCaption(ep, feedTitle));
+      }
       return;
     } catch (e) {
       console.error("sendAudio by URL failed, queueing for worker", e);
@@ -217,6 +262,7 @@ async function sendEpisode(chatId: string, ep: Episode, feedTitle: string) {
     caption: podcastCaption(ep, feedTitle),
     title: ep.title.slice(0, 64),
     performer: feedTitle.slice(0, 64),
+    cache_key: cacheKey,
   });
   await say(chatId, `⏳ <b>${esc(ep.title)}</b>${size ? ` (${fmtSize(size)})` : ""} — downloading, the file will arrive in a few minutes`);
 }
@@ -824,10 +870,23 @@ async function handleCallback(cbq: Record<string, any>) {
 
     let note: string;
     if (YT_JOBS[kind]) {
-      const url = `https://www.youtube.com/watch?v=${parts[1]}`;
-      // ack_message_id: воркер поставит 👍 на карточку, когда файл отправлен
-      await enqueue(YT_JOBS[kind].type, { chat_id: chatId, url, ack_message_id: cbq.message.message_id });
+      const videoId = parts[1];
+      const cacheKey = `yt:${videoId}:${kind}`;
+      // Уже загружали этот контент → шлём по file_id мгновенно, без воркера
+      const cached = await cachedFile(cacheKey);
+      if (cached) {
+        await deliverCached(cbq, chatId, cached);
+        return;
+      }
+      const url = `https://www.youtube.com/watch?v=${videoId}`;
+      // ack_message_id: воркер поставит 👍; cache_key — под каким ключом сохранить file_id
+      await enqueue(YT_JOBS[kind].type, { chat_id: chatId, url, ack_message_id: cbq.message.message_id, cache_key: cacheKey });
       note = YT_JOBS[kind].note;
+      // Русская озвучка: впервые переводимое видео Яндекс готовит минутами — предупреждаем,
+      // чтобы не выглядело зависшим
+      if (kind === "rv" || kind === "ra") {
+        await say(chatId, "🔊 Requested a Russian dub from Yandex. First-time translations take a few minutes — I'll send the file when it's ready.");
+      }
     } else {
       // pd:<subId>:<idx> — эпизод подкаста
       const { data: sub } = await db.from("subscriptions").select("*").eq("id", Number(parts[1])).maybeSingle();
@@ -835,7 +894,13 @@ async function handleCallback(cbq: Record<string, any>) {
       const feed = await fetchFeed((sub as Sub).feed_url);
       const ep = feed.episodes[Number(parts[2])];
       if (!ep) throw new Error("episode not found");
-      await sendEpisode(chatId, ep, feed.title); // сам решит: сразу или через воркер
+      const cacheKey = `pod:${ep.guid}`;
+      const cached = await cachedFile(cacheKey);
+      if (cached) {
+        await deliverCached(cbq, chatId, cached);
+        return;
+      }
+      await sendEpisode(chatId, ep, feed.title, cacheKey); // сам решит: сразу или через воркер
       note = "Downloading episode";
     }
     await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: `${note}…` });
@@ -961,6 +1026,11 @@ async function workerApi(body: Record<string, any>): Promise<Response> {
         updated_at: new Date().toISOString(),
       })
       .eq("id", body.id);
+    return json({ ok: true });
+  }
+  // Воркер отдал file_id залитого файла — кэшируем для мгновенных повторов
+  if (body.action === "save_file") {
+    await saveFile(body.cache_key, body.file_id, body.file_type, body.caption);
     return json({ ok: true });
   }
   return json({ error: "unknown action" }, 400);

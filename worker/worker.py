@@ -67,6 +67,21 @@ def notify(chat_id, text_html):
         print("notify failed:", e, flush=True)
 
 
+def cache_file(p, result, file_type, caption=""):
+    """Сохраняет file_id залитого файла в edge (таблица tg_files) — повторный
+    запрос того же контента бот отдаст мгновенно, без скачивания/заливки."""
+    ck = p.get("cache_key")
+    if not ck or not result:
+        return
+    fid = (result.get(file_type) or {}).get("file_id")
+    if not fid:
+        return
+    try:
+        edge("save_file", cache_key=ck, file_id=fid, file_type=file_type, caption=caption or "")
+    except Exception as e:
+        print("save_file failed:", e, flush=True)
+
+
 def safe_name(s, ext):
     s = re.sub(r"[^\w\d .,()\[\]-]+", "", s, flags=re.U).strip() or "file"
     return f"{s[:60]}.{ext}"
@@ -121,7 +136,7 @@ def do_send_audio(p, tmp):
                 fh.write(chunk)
     check_size(f)
     with open(f, "rb") as fh:
-        tg(
+        res = tg(
             "sendAudio",
             files={"audio": (safe_name(p.get("title") or "episode", "mp3"), fh)},
             chat_id=p["chat_id"],
@@ -130,6 +145,7 @@ def do_send_audio(p, tmp):
             title=p.get("title", ""),
             performer=p.get("performer", ""),
         )
+    cache_file(p, res, "audio", p.get("caption", ""))
 
 
 # В yt-dlp 2026 решатель YouTube n-challenge вынесен в отдельный EJS-компонент,
@@ -241,16 +257,18 @@ def do_youtube(p, tmp, audio_only):
     channel = (info.get("channel") or info.get("uploader") or "")[:64]
     with open(f, "rb") as fh:
         if audio_only or f.suffix == ".m4a":
-            tg("sendAudio", files={"audio": (safe_name(title, "m4a"), fh)},
-               chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-               title=title, performer=channel,
-               duration=int(info.get("duration") or 0))
+            res = tg("sendAudio", files={"audio": (safe_name(title, "m4a"), fh)},
+                     chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+                     title=title, performer=channel,
+                     duration=int(info.get("duration") or 0))
+            cache_file(p, res, "audio", cap)
         else:
-            tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
-               chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-               supports_streaming="true",
-               duration=int(info.get("duration") or 0),
-               width=int(info.get("width") or 0), height=int(info.get("height") or 0))
+            res = tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
+                     chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+                     supports_streaming="true",
+                     duration=int(info.get("duration") or 0),
+                     width=int(info.get("width") or 0), height=int(info.get("height") or 0))
+            cache_file(p, res, "video", cap)
 
 
 # ---------- Русская закадровая озвучка (Яндекс, через vot-cli) ----------
@@ -325,16 +343,15 @@ def vot_translate_audio(url, tmp, src_lang="auto"):
     raise RuntimeError("translation finished but no audio file was found")
 
 
-def mux_ru(video_path, ru_path, out_path, orig_volume=0.15):
-    """Кладёт русскую дорожку поверх приглушённого оригинала (как в Яндекс.Браузере)."""
+def replace_audio(video_path, ru_path, out_path):
+    """Заменяет дорожку видео на русскую озвучку (чистый голос, без фонового
+    оригинала). Видео копируется без перекодирования, энкодится только аудио —
+    заметно быстрее микса с amix (тот декодировал обе дорожки + фильтр на весь час)."""
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(video_path), "-i", str(ru_path),
-         "-filter_complex",
-         f"[0:a]volume={orig_volume}[a0];[1:a]volume=1.0[a1];"
-         "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]",
-         "-map", "0:v", "-map", "[aout]",
+         "-map", "0:v:0", "-map", "1:a:0",
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-         "-movflags", "+faststart", str(out_path)],
+         "-shortest", "-movflags", "+faststart", str(out_path)],
         check=True, capture_output=True,
     )
 
@@ -364,10 +381,11 @@ def do_youtube_audio_ru(p, tmp):
     title = (info.get("title") or "audio")[:64]
     channel = (info.get("channel") or info.get("uploader") or "")[:64]
     with open(ru, "rb") as fh:
-        tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
-           chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-           title=title, performer=channel,
-           duration=int(info.get("duration") or probe_duration(ru)))
+        res = tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
+                 chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+                 title=title, performer=channel,
+                 duration=int(info.get("duration") or probe_duration(ru)))
+    cache_file(p, res, "audio", cap)
     print(f"audio_ru: upload {time.monotonic() - t1:.0f}s", flush=True)
 
 
@@ -386,24 +404,26 @@ def do_youtube_video_ru(p, tmp):
     channel = (info.get("channel") or info.get("uploader") or "")[:64]
     cap = yt_caption(p, info, extra=RU_TAG)
     out = tmp / "ru_video.mp4"
-    mux_ru(vf, ru, out)
+    replace_audio(vf, ru, out)
     # Видео с озвучкой не влезло в лимит — пришлём хотя бы русское аудио
     if out.stat().st_size > TG_MAX:
         notify(p["chat_id"], "⚠️ Dubbed video is over 2 GB — sending the Russian audio track only")
         check_size(ru)
         with open(ru, "rb") as fh:
-            tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
-               chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-               title=title, performer=channel,
-               duration=int(info.get("duration") or probe_duration(ru)))
+            res = tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
+                     chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+                     title=title, performer=channel,
+                     duration=int(info.get("duration") or probe_duration(ru)))
+        cache_file(p, res, "audio", cap)
         return
     check_size(out)
     with open(out, "rb") as fh:
-        tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
-           chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-           supports_streaming="true",
-           duration=int(info.get("duration") or 0),
-           width=int(info.get("width") or 0), height=int(info.get("height") or 0))
+        res = tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
+                 chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+                 supports_streaming="true",
+                 duration=int(info.get("duration") or 0),
+                 width=int(info.get("width") or 0), height=int(info.get("height") or 0))
+    cache_file(p, res, "video", cap)
 
 
 def do_youtube_subs(p, tmp):
