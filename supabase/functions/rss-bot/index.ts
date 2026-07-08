@@ -354,7 +354,7 @@ const HELP = `<b>Commands:</b>
 /last5 /last10 N — recent episodes of subscription N
 /add link or name — podcast or YouTube channel
 /del — unsubscribe
-/video link — download a YouTube video (up to 720p)
+/video link — download a YouTube video (up to 480p)
 /audio link — extract audio from a YouTube video
 /digest on|off — daily digest of new episodes (07:00 UTC)
 /status — download queue and recent errors

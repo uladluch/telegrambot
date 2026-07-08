@@ -25,8 +25,9 @@ API = f"{BOT_API}/bot{BOT_TOKEN}"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 TG_MAX = 1_950_000_000  # self-hosted bot-api пускает до 2000 МБ
 
-# Перевод на серверах Яндекса асинхронный, vot-cli сам поллит — таймаут щедрый.
-VOT_TIMEOUT = int(os.environ.get("VOT_TIMEOUT", "1200"))
+# Перевод на серверах Яндекса асинхронный, vot-cli сам поллит — таймаут щедрый:
+# 3-часовой подкаст, который Яндекс переводит впервые, занимает десятки минут.
+VOT_TIMEOUT = int(os.environ.get("VOT_TIMEOUT", "3600"))
 # Запасной выход, если Яндекс забанит датацентровый IP Railway: прокси для vot-cli
 VOT_PROXY = os.environ.get("VOT_PROXY")
 
@@ -148,9 +149,10 @@ def run_ytdlp(url, tmp, audio_only):
     else:
         # Telegram проигрывает inline только H.264 (avc1) + AAC (m4a); AV1/VP9/Opus
         # он показывает статичным первым кадром без плеера — поэтому предпочитаем avc1.
-        # faststart двигает moov-атом в начало файла, иначе нет потокового воспроизведения.
-        cmd += ["-f", "bv*[height<=?720][vcodec^=avc1]+ba[ext=m4a]/"
-                      "b[height<=?720][vcodec^=avc1]/bv*[height<=?720]+ba/b",
+        # 480p: файлы легче и заливаются быстрее. faststart двигает moov-атом
+        # в начало файла, иначе нет потокового воспроизведения.
+        cmd += ["-f", "bv*[height<=?480][vcodec^=avc1]+ba[ext=m4a]/"
+                      "b[height<=?480][vcodec^=avc1]/bv*[height<=?480]+ba/b",
                 "--merge-output-format", "mp4",
                 "--postprocessor-args", "ffmpeg:-movflags +faststart"]
     cmd.append(url)
