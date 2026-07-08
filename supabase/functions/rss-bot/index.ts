@@ -468,7 +468,7 @@ async function cmdAdd(chatId: string, arg: string) {
 }
 
 function subButtonLabel(s: Sub) {
-  return `#${s.id} ${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`;
+  return `${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`;
 }
 
 // Каждая подписка — кнопка: тап → последний эпизод, глубже — через «⬇️ 5 more».
