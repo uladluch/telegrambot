@@ -1,18 +1,20 @@
 // Личный Telegram-бот: подписки на RSS подкастов и YouTube-каналы.
-// Ничего не качается автоматически — всё по запросу:
-//  /latest         — эпизоды всех подписок за последние сутки (карточки с кнопками)
+// Интерфейс английский. Файлы не качаются сами — всё по запросу:
+//  /latest          — эпизоды всех подписок за последние сутки (карточки с кнопками)
+//  /list            — подписки кнопками (тап → 5 последних эпизодов)
 //  /last5 /last10 N — N последних эпизодов конкретной подписки
-//  кнопки на карточке — скачать видео/аудио/эпизод (задание уходит воркеру)
-//  /clear          — удалить переписку с ботом (подписки не трогает)
+//  кнопки на карточке — скачать видео/аудио/озвучку/субтитры (задание уходит воркеру)
+//  /digest on|off   — ежедневный текстовый дайджест (07:00 UTC, только карточки)
+//  /clear           — удалить переписку с ботом (подписки не трогает)
 //
 // Архитектура:
 //  - эта функция — "мозг": команды, подписки, очередь заданий;
 //  - на Railway живёт self-hosted telegram-bot-api (лимит файлов 2 ГБ) и воркер
-//    с yt-dlp, который забирает задания из очереди (таблица jobs).
+//    с yt-dlp/vot-cli, который забирает задания из очереди (таблица jobs).
 //
 // Деплой с verify_jwt=false — авторизация своя: Telegram шлёт
-// x-telegram-bot-api-secret-token, воркер — x-worker-secret.
-// Очистка старых заданий и хранилища — отдельным pg_cron прямо в БД.
+// x-telegram-bot-api-secret-token, воркер — x-worker-secret, pg_cron — x-cron-secret
+// (дайджест и watchdog зависших заданий).
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -21,6 +23,7 @@ import { XMLParser } from "npm:fast-xml-parser@4.5.0";
 const BOT_TOKEN = "8123884090:AAHI6cpcQPZcXggtQ-lk2llcDf0QC2OOu3c";
 const WEBHOOK_SECRET = "9e0f3e6f5ad21f545b6ba8fcf0d4aca7efed3b9fdb430da2";
 const WORKER_SECRET = "9c26f18e84c246271d28b248b0bf56445921be1cb6a5f569";
+const CRON_SECRET = "b57e02c1f4d98a366c2e9b0d715f4ac8de360b9271c5e884";
 // Self-hosted Bot API на Railway (бот разлогинен из облака Telegram)
 const TG_API = `https://bot-api-production-0811.up.railway.app/bot${BOT_TOKEN}`;
 
@@ -87,7 +90,7 @@ async function fetchFeed(url: string): Promise<{ title: string; episodes: Episod
     redirect: "follow",
     signal: AbortSignal.timeout(30_000),
   });
-  if (!res.ok) throw new Error(`фид вернул HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`feed returned HTTP ${res.status}`);
   const xml = xmlParser.parse(await res.text());
 
   // Atom — так выглядит фид YouTube-канала
@@ -97,7 +100,7 @@ async function fetchFeed(url: string): Promise<{ title: string; episodes: Episod
       const link = Array.isArray(en.link) ? en.link[0] : en.link;
       return {
         guid: text(en["yt:videoId"]) ?? text(en.id) ?? text(en.title) ?? "",
-        title: text(en.title) ?? "(без названия)",
+        title: text(en.title) ?? "(untitled)",
         link: (link as Record<string, string> | undefined)?.["@_href"],
         pubDate: text(en.published),
       };
@@ -107,12 +110,12 @@ async function fetchFeed(url: string): Promise<{ title: string; episodes: Episod
   }
 
   const channel = xml?.rss?.channel;
-  if (!channel) throw new Error("это не RSS/Atom-фид");
+  if (!channel) throw new Error("not an RSS/Atom feed");
   const rawItems = Array.isArray(channel.item) ? channel.item : channel.item ? [channel.item] : [];
   const episodes: Episode[] = [];
   for (const it of rawItems) {
     const enclosure = Array.isArray(it.enclosure) ? it.enclosure[0] : it.enclosure;
-    const title = text(it.title) ?? "(без названия)";
+    const title = text(it.title) ?? "(untitled)";
     const guid = text(it.guid) ?? text(enclosure?.["@_url"]) ?? title;
     episodes.push({
       guid,
@@ -136,14 +139,14 @@ function fmtDate(d?: string) {
 }
 
 function fmtSize(bytes?: number) {
-  return bytes ? `${Math.round(bytes / 1024 / 1024)} МБ` : "";
+  return bytes ? `${Math.round(bytes / 1024 / 1024)} MB` : "";
 }
 
 function podcastCaption(ep: Episode, feedTitle: string) {
   const parts = [`<b>${esc(ep.title)}</b>`, esc(feedTitle)];
   const meta = [fmtDate(ep.pubDate), ep.duration].filter(Boolean).join(" · ");
   if (meta) parts.push(meta);
-  if (ep.link) parts.push(`<a href="${esc(ep.link)}">Страница эпизода</a>`);
+  if (ep.link) parts.push(`<a href="${esc(ep.link)}">Episode page</a>`);
   return parts.join("\n").slice(0, 1024);
 }
 
@@ -163,19 +166,19 @@ async function audioSize(ep: Episode): Promise<number | undefined> {
 
 async function enqueue(type: string, payload: Record<string, unknown>) {
   const { error } = await db.from("jobs").insert({ type, payload });
-  if (error) throw new Error(`не смог поставить задание в очередь: ${error.message}`);
+  if (error) throw new Error(`couldn't queue the job: ${error.message}`);
 }
 
 // Скачивает и присылает эпизод подкаста файлом (маленькие — сразу, большие — через воркер)
 async function sendEpisode(chatId: string, ep: Episode, feedTitle: string) {
   if (!ep.audioUrl) {
-    await say(chatId, `${podcastCaption(ep, feedTitle)}\n\n⚠️ в фиде нет аудиофайла`);
+    await say(chatId, `${podcastCaption(ep, feedTitle)}\n\n⚠️ the feed has no audio file`);
     return;
   }
   const size = await audioSize(ep);
 
   if (size && size > TG_MAX) {
-    await say(chatId, `${podcastCaption(ep, feedTitle)}\n\n⚠️ файл ${fmtSize(size)} — больше лимита Telegram 2 ГБ\n<a href="${esc(ep.audioUrl)}">Скачать MP3 напрямую</a>`);
+    await say(chatId, `${podcastCaption(ep, feedTitle)}\n\n⚠️ the file is ${fmtSize(size)} — over Telegram's 2 GB limit\n<a href="${esc(ep.audioUrl)}">Download the MP3 directly</a>`);
     return;
   }
 
@@ -202,7 +205,7 @@ async function sendEpisode(chatId: string, ep: Episode, feedTitle: string) {
     title: ep.title.slice(0, 64),
     performer: feedTitle.slice(0, 64),
   });
-  await say(chatId, `⏳ <b>${esc(ep.title)}</b>${size ? ` (${fmtSize(size)})` : ""} — качаю, пришлю файлом через несколько минут`);
+  await say(chatId, `⏳ <b>${esc(ep.title)}</b>${size ? ` (${fmtSize(size)})` : ""} — downloading, the file will arrive in a few minutes`);
 }
 
 // ---------- Карточки ----------
@@ -233,28 +236,40 @@ function hasCyrillic(s: string) {
   return /[а-яё]/i.test(s);
 }
 
+// Клавиатура YouTube-карточки. С RU-рядом кнопки оригинала подписаны EN,
+// без него (русскоязычный канал) — нейтральные Video/Audio. Плюс субтитры.
+// v/a — оригинал, rv/ra — русская озвучка (Яндекс), s — субтитры.
+function ytKeyboard(videoId: string, withRu: boolean) {
+  const original = withRu
+    ? [
+      { text: "🎬 EN", callback_data: `v:${videoId}` },
+      { text: "🎧 EN", callback_data: `a:${videoId}` },
+    ]
+    : [
+      { text: "🎬 Video", callback_data: `v:${videoId}` },
+      { text: "🎧 Audio", callback_data: `a:${videoId}` },
+    ];
+  const rows = [original];
+  if (withRu) {
+    rows.push([
+      { text: "🎬 RU", callback_data: `rv:${videoId}` },
+      { text: "🎧 RU", callback_data: `ra:${videoId}` },
+    ]);
+  }
+  rows.push([{ text: "📝 Subs", callback_data: `s:${videoId}` }]);
+  return rows;
+}
+
 // Карточка YouTube-видео: Telegram сам развернёт превью из ссылки, снизу — кнопки.
-// Верхний ряд — оригинал: "v:<videoId>" (видео) / "a:<videoId>" (аудио).
-// Нижний ряд — русская закадровая озвучка (Яндекс): "rv:" (видео) / "ra:" (аудио).
 async function youtubeCard(chatId: string, ep: Episode, feedTitle: string) {
   const url = ep.link ?? `https://www.youtube.com/watch?v=${ep.guid}`;
   const date = fmtDate(ep.pubDate);
-  const keyboard = [[
-    { text: "⬇️ Видео", callback_data: `v:${ep.guid}` },
-    { text: "🎧 Аудио", callback_data: `a:${ep.guid}` },
-  ]];
-  if (!hasCyrillic(`${feedTitle} ${ep.title}`)) {
-    keyboard.push([
-      { text: "🎬 RU", callback_data: `rv:${ep.guid}` },
-      { text: "🎧 RU", callback_data: `ra:${ep.guid}` },
-    ]);
-  }
   await tg("sendMessage", {
     chat_id: chatId,
     text: `🎬 <b>${esc(feedTitle)}</b>${date ? `\n📅 ${date}` : ""}\n${esc(url)}`,
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
-    reply_markup: { inline_keyboard: keyboard },
+    reply_markup: { inline_keyboard: ytKeyboard(ep.guid, !hasCyrillic(`${feedTitle} ${ep.title}`)) },
   });
 }
 
@@ -267,18 +282,7 @@ async function linkCard(chatId: string, videoId: string) {
     text: esc(url),
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "⬇️ Видео", callback_data: `v:${videoId}` },
-          { text: "🎧 Аудио", callback_data: `a:${videoId}` },
-        ],
-        [
-          { text: "🎬 RU", callback_data: `rv:${videoId}` },
-          { text: "🎧 RU", callback_data: `ra:${videoId}` },
-        ],
-      ],
-    },
+    reply_markup: { inline_keyboard: ytKeyboard(videoId, true) },
   });
 }
 
@@ -288,14 +292,14 @@ async function podcastCard(chatId: string, sub: Sub, ep: Episode, idx: number) {
   const meta = [fmtDate(ep.pubDate), ep.duration].filter(Boolean).join(" · ");
   const lines = [`🎧 <b>${esc(ep.title)}</b>`, esc(sub.title ?? "")];
   if (meta) lines.push(meta);
-  if (ep.link) lines.push(`<a href="${esc(ep.link)}">Страница эпизода</a>`);
+  if (ep.link) lines.push(`<a href="${esc(ep.link)}">Episode page</a>`);
   await tg("sendMessage", {
     chat_id: chatId,
     text: lines.join("\n").slice(0, 4096),
     parse_mode: "HTML",
     link_preview_options: { is_disabled: true },
     reply_markup: {
-      inline_keyboard: [[{ text: "⬇️ Скачать MP3", callback_data: `pd:${sub.id}:${idx}` }]],
+      inline_keyboard: [[{ text: "🎧 MP3", callback_data: `pd:${sub.id}:${idx}` }]],
     },
   });
 }
@@ -308,17 +312,21 @@ async function renderCard(chatId: string, sub: Sub, ep: Episode, feedTitle: stri
 
 // Собирает до max видимых эпизодов (для youtube пропускает shorts), новейший → старый.
 // keep(ep) === false прерывает сбор — список отсортирован по дате, дальше только старее.
+// offset пропускает первые N подходящих — для кнопки "5 more".
 async function collectEpisodes(
   sub: Sub,
   episodes: Episode[],
   keep: (ep: Episode) => boolean,
   max: number,
+  offset = 0,
 ): Promise<{ ep: Episode; idx: number }[]> {
   const out: { ep: Episode; idx: number }[] = [];
+  let seen = 0;
   for (let i = 0; i < episodes.length && out.length < max; i++) {
     const ep = episodes[i];
     if (!keep(ep)) break;
     if (sub.kind === "youtube" && (await isYoutubeShort(ep.guid))) continue;
+    if (seen++ < offset) continue;
     out.push({ ep, idx: i });
   }
   return out;
@@ -326,19 +334,20 @@ async function collectEpisodes(
 
 // ---------- Команды ----------
 
-const HELP = `<b>Команды:</b>
-/latest — эпизоды всех подписок за последние сутки
-/list — подписки кнопками: жми на любую, пришлю 5 последних
-/last5 /last10 номер — последние эпизоды подписки
-/add ссылка или название — подкаст или YouTube-канал
-/del номер — отписаться
-/video ссылка — скачать видео с YouTube (до 720p)
-/audio ссылка — вытащить аудио из YouTube-видео
-/status — что сейчас в очереди и ошибки за сутки
-/clear — очистить переписку с ботом (подписки не трогает)
-/help — справка
+const HELP = `<b>Commands:</b>
+/latest — new episodes from all subscriptions (last 24h)
+/list — subscriptions as buttons: tap one for its last 5 episodes
+/last5 /last10 N — recent episodes of subscription N
+/add link or name — podcast or YouTube channel
+/del — unsubscribe
+/video link — download a YouTube video (up to 720p)
+/audio link — extract audio from a YouTube video
+/digest on|off — daily digest of new episodes (07:00 UTC)
+/status — download queue and recent errors
+/clear — wipe this chat (subscriptions stay)
+/help — this help
 
-Самое простое: пришли (или перешли) ссылку на YouTube-видео без всяких команд — отвечу карточкой с кнопками. На карточке жмёшь кнопку, и бот присылает файл (видео до 2 ГБ). Ряд «🎬 RU» / «🎧 RU» — русская закадровая озвучка через Яндекс (перевод идёт на серверах Яндекса, занимает пару минут). Свои эпизоды храни у себя — на сервере ничего не остаётся.`;
+Easiest way: just send (or forward) a YouTube link — you'll get a card with buttons. 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), 📝 Subs — subtitles file. Files up to 2 GB. Nothing is stored on the server — keep your files in the chat.`;
 
 async function getOwner(): Promise<string | null> {
   const { data } = await db.from("bot_state").select("value").eq("key", "owner_chat_id").maybeSingle();
@@ -368,7 +377,7 @@ async function resolveYoutubeChannelId(input: string): Promise<string> {
     html.match(/"externalId":"(UC[\w-]{22})"/) ??
     html.match(/"channelId":"(UC[\w-]{22})"/) ??
     html.match(/channel\/(UC[\w-]{22})/);
-  if (!m) throw new Error("не смог определить канал — пришли ссылку вида youtube.com/channel/UC…");
+  if (!m) throw new Error("couldn't detect the channel — send a youtube.com/channel/UC… link");
   return m[1];
 }
 
@@ -383,13 +392,13 @@ async function resolveFeed(query: string): Promise<{ url: string; kind: string }
   );
   const data = await res.json();
   const feedUrl = data.results?.[0]?.feedUrl;
-  if (!feedUrl) throw new Error("подкаст не нашёлся в каталоге iTunes — пришли прямую ссылку на RSS или YouTube-канал");
+  if (!feedUrl) throw new Error("podcast not found in the iTunes catalog — send a direct RSS link or a YouTube channel");
   return { url: feedUrl, kind: "podcast" };
 }
 
 async function cmdAdd(chatId: string, arg: string) {
   if (!arg) {
-    await say(chatId, "Использование: <code>/add https://ссылка-на-rss</code>, <code>/add название подкаста</code> или <code>/add ссылка-на-youtube-канал</code>");
+    await say(chatId, "Usage: <code>/add https://rss-link</code>, <code>/add podcast name</code> or <code>/add youtube-channel-link</code>");
     return;
   }
   const { url, kind } = await resolveFeed(arg);
@@ -401,7 +410,7 @@ async function cmdAdd(chatId: string, arg: string) {
     .single();
   if (error) {
     if (error.code === "23505") {
-      await say(chatId, `Уже есть подписка на <b>${esc(feed.title)}</b>`);
+      await say(chatId, `Already subscribed to <b>${esc(feed.title)}</b>`);
       return;
     }
     throw new Error(error.message);
@@ -409,54 +418,71 @@ async function cmdAdd(chatId: string, arg: string) {
   const latest = feed.episodes[0];
   await say(
     chatId,
-    `✅ Подписал: <b>${esc(feed.title)}</b> (#${sub.id}, ${kind === "youtube" ? "YouTube" : "подкаст"})\n` +
-      (latest ? `Последний: ${esc(latest.title)} (${fmtDate(latest.pubDate)})\n` : "") +
-      `Посмотреть: <code>/last5 ${sub.id}</code>`,
+    `✅ Subscribed: <b>${esc(feed.title)}</b> (#${sub.id}, ${kind === "youtube" ? "YouTube" : "podcast"})\n` +
+      (latest ? `Latest: ${esc(latest.title)} (${fmtDate(latest.pubDate)})\n` : "") +
+      `Browse it: <code>/last5 ${sub.id}</code>`,
   );
 }
 
-// Каждая подписка — кнопка: жмёшь и получаешь 5 последних эпизодов.
-// Не нужно запоминать номер и печатать /last5 N. callback_data: "l5:<subId>".
+function subButtonLabel(s: Sub) {
+  return `#${s.id} ${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`;
+}
+
+// Каждая подписка — кнопка: тап → 5 последних эпизодов. Номера помнить не нужно.
 async function cmdList(chatId: string) {
   const { data: subs } = await db.from("subscriptions").select("*").order("id");
   if (!subs?.length) {
-    await say(chatId, "Подписок пока нет. Добавь: <code>/add joe rogan</code>");
+    await say(chatId, "No subscriptions yet. Add one: <code>/add joe rogan</code>");
     return;
   }
-  const rows = (subs as Sub[]).map((s) => [{
-    text: `#${s.id} ${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`,
-    callback_data: `l5:${s.id}`,
-  }]);
+  const rows = (subs as Sub[]).map((s) => [{ text: subButtonLabel(s), callback_data: `l5:${s.id}` }]);
   await tg("sendMessage", {
     chat_id: chatId,
-    text: "<b>Подписки</b> — жми на любую, пришлю 5 последних эпизодов:",
+    text: "<b>Subscriptions</b> — tap one to get its last 5 episodes:",
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: rows },
   });
 }
 
+// /del: с номером — сразу; без — список кнопками с подтверждением (del: → delok:/delno)
 async function cmdDel(chatId: string, arg: string) {
+  if (!arg) {
+    const { data: subs } = await db.from("subscriptions").select("*").order("id");
+    if (!subs?.length) {
+      await say(chatId, "No subscriptions to remove");
+      return;
+    }
+    const rows = (subs as Sub[]).map((s) => [{ text: subButtonLabel(s), callback_data: `del:${s.id}` }]);
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: "<b>Unsubscribe</b> — pick one:",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: rows },
+    });
+    return;
+  }
   const id = Number(arg.replace("#", ""));
   if (!id) {
-    await say(chatId, "Использование: <code>/del номер</code> (номер из /list)");
+    await say(chatId, "Usage: <code>/del</code> (buttons) or <code>/del N</code> (number from /list)");
     return;
   }
   const { data } = await db.from("subscriptions").delete().eq("id", id).select();
   await say(
     chatId,
-    data?.length ? `Отписал от: ${esc((data[0] as Sub).title ?? (data[0] as Sub).feed_url)}` : `Подписки #${id} нет`,
+    data?.length ? `Unsubscribed from: ${esc((data[0] as Sub).title ?? (data[0] as Sub).feed_url)}` : `No subscription #${id}`,
   );
 }
 
-// /latest — карточки эпизодов всех подписок за последние сутки
-async function cmdLatestAll(chatId: string) {
+// /latest и утренний дайджест: собираем всё, потом шлём. digest=true — тихий режим
+// (нет сообщений «ничего нового», зато есть заголовок перед карточками).
+async function cmdLatestAll(chatId: string, digest = false) {
   const { data: subs } = await db.from("subscriptions").select("*").order("id");
   if (!subs?.length) {
-    await say(chatId, "Подписок пока нет. Добавь: <code>/add joe rogan</code>");
+    if (!digest) await say(chatId, "No subscriptions yet. Add one: <code>/add joe rogan</code>");
     return;
   }
   const cutoff = Date.now() - DAY_MS;
-  let shown = 0;
+  const items: { sub: Sub; ep: Episode; feedTitle: string; idx: number }[] = [];
   for (const sub of subs as Sub[]) {
     try {
       const feed = await fetchFeed(sub.feed_url);
@@ -466,45 +492,78 @@ async function cmdLatestAll(chatId: string) {
         (ep) => (Date.parse(ep.pubDate ?? "") || 0) >= cutoff,
         50,
       );
-      // Отправляем старые → новые, чтобы самый свежий оказался внизу
+      // Старые → новые, чтобы самый свежий оказался внизу чата
       for (let j = picked.length - 1; j >= 0; j--) {
-        await renderCard(chatId, sub, picked[j].ep, feed.title, picked[j].idx);
-        shown++;
+        items.push({ sub, ep: picked[j].ep, feedTitle: feed.title, idx: picked[j].idx });
       }
     } catch (e) {
       console.error(`latest failed for ${sub.feed_url}`, e);
     }
   }
-  if (shown === 0) await say(chatId, "За последние сутки новых эпизодов нет");
+  if (!items.length) {
+    if (!digest) await say(chatId, "No new episodes in the last 24 hours");
+    return;
+  }
+  if (digest) await say(chatId, "☀️ <b>Daily digest</b> — new episodes from your subscriptions:");
+  for (const it of items) await renderCard(chatId, it.sub, it.ep, it.feedTitle, it.idx);
 }
 
-// /last5, /last10 — N последних эпизодов подписки карточками
-async function cmdLast(chatId: string, arg: string, n: number) {
+// /last5, /last10 и кнопки из /list — N эпизодов подписки карточками, с пагинацией
+async function cmdLast(chatId: string, arg: string, n: number, offset = 0) {
   const id = Number(arg.replace("#", ""));
   if (!id) {
-    await say(chatId, `Использование: <code>/last${n} номер</code> (номер из /list)`);
+    await say(chatId, `Usage: <code>/last${n} N</code> (number from /list)`);
     return;
   }
   const { data: sub } = await db.from("subscriptions").select("*").eq("id", id).maybeSingle();
   if (!sub) {
-    await say(chatId, `Подписки #${id} нет`);
+    await say(chatId, `No subscription #${id}`);
     return;
   }
   const feed = await fetchFeed((sub as Sub).feed_url);
-  const picked = await collectEpisodes(sub as Sub, feed.episodes, () => true, n);
-  // Отправляем старые → новые, чтобы самый свежий оказался внизу
+  const picked = await collectEpisodes(sub as Sub, feed.episodes, () => true, n, offset);
+  // Старые → новые, чтобы самый свежий оказался внизу чата
   for (let j = picked.length - 1; j >= 0; j--) {
     await renderCard(chatId, sub as Sub, picked[j].ep, feed.title, picked[j].idx);
   }
-  if (picked.length === 0) await say(chatId, "В фиде нет эпизодов");
+  if (picked.length === 0) {
+    await say(chatId, offset ? "No more episodes" : "The feed has no episodes");
+    return;
+  }
+  // Полная порция — вероятно, есть ещё: кнопка следующей страницы
+  if (picked.length === n) {
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: `More from <b>${esc(feed.title)}</b>?`,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "⬇️ 5 more", callback_data: `l5:${id}:${offset + picked.length}` }]],
+      },
+    });
+  }
+}
+
+async function cmdDigest(chatId: string, arg: string) {
+  const v = arg.trim().toLowerCase();
+  if (v === "on" || v === "off") {
+    await db.from("bot_state").upsert({ key: "digest", value: v });
+    await say(chatId, v === "on"
+      ? "☀️ Daily digest is <b>on</b> — every day at 07:00 UTC I'll send cards for new episodes (nothing on quiet days)"
+      : "🌙 Daily digest is <b>off</b>");
+    return;
+  }
+  const { data } = await db.from("bot_state").select("value").eq("key", "digest").maybeSingle();
+  const state = data?.value === "off" ? "off" : "on";
+  await say(chatId, `Daily digest is <b>${state}</b>. Toggle: <code>/digest on</code> / <code>/digest off</code>`);
 }
 
 const JOB_LABEL: Record<string, string> = {
-  send_audio: "🎧 подкаст",
-  yt_video: "⬇️ видео",
-  yt_audio: "🎧 аудио",
-  yt_video_ru: "🎬 видео RU",
-  yt_audio_ru: "🎧 аудио RU",
+  send_audio: "🎧 podcast",
+  yt_video: "🎬 video",
+  yt_audio: "🎧 audio",
+  yt_video_ru: "🎬 video RU",
+  yt_audio_ru: "🎧 audio RU",
+  yt_subs: "📝 subs",
 };
 
 // /status — что в очереди у воркера и какие ошибки были за сутки
@@ -515,16 +574,16 @@ async function cmdStatus(chatId: string) {
     .gte("updated_at", dayAgo).order("id", { ascending: false }).limit(3);
   const lines: string[] = [];
   if (active?.length) {
-    lines.push("<b>В работе:</b>");
+    lines.push("<b>In progress:</b>");
     for (const j of active) {
       const url = String(j.payload?.url ?? "").slice(0, 60);
       lines.push(`${j.status === "running" ? "▶️" : "⏳"} ${JOB_LABEL[j.type] ?? j.type} ${esc(url)}`);
     }
   } else {
-    lines.push("Очередь пуста — ничего не качается");
+    lines.push("Queue is empty — nothing is downloading");
   }
   if (errs?.length) {
-    lines.push("", "<b>Ошибки за сутки:</b>");
+    lines.push("", "<b>Errors in the last 24h:</b>");
     for (const j of errs) lines.push(`⚠️ ${JOB_LABEL[j.type] ?? j.type}: ${esc(String(j.error ?? "").slice(0, 100))}`);
   }
   await say(chatId, lines.join("\n"));
@@ -542,30 +601,115 @@ async function cmdClear(chatId: string, upToMsgId: number) {
   await db.from("bot_state").upsert({ key: "clear_floor", value: String(upToMsgId) });
 }
 
+// ---------- Cron (pg_cron → сюда с x-cron-secret) ----------
+
+async function handleCron(task: string) {
+  try {
+    const owner = await getOwner();
+    if (!owner) return;
+
+    // Watchdog: задания, висящие в running дольше 2 часов, помечаем ошибкой
+    if (task === "watchdog") {
+      const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      const { data } = await db.from("jobs")
+        .update({ status: "error", error: "timed out — killed by watchdog", updated_at: new Date().toISOString() })
+        .eq("status", "running")
+        .lt("updated_at", cutoff)
+        .select();
+      if (data?.length) {
+        await say(owner, `⚠️ ${data.length} stuck download(s) (running over 2h) marked as failed — see /status`);
+      }
+      return;
+    }
+
+    // Дайджест: карточки новых эпизодов; в тихие дни — ничего
+    const { data } = await db.from("bot_state").select("value").eq("key", "digest").maybeSingle();
+    if (data?.value === "off") return;
+    await cmdLatestAll(owner, true);
+  } catch (e) {
+    console.error("cron task failed", task, e);
+  }
+}
+
+// ---------- Колбэки ----------
+
 async function handleCallback(cbq: Record<string, any>) {
   const chatId = String(cbq.message?.chat?.id ?? "");
   const owner = await getOwner();
   const parts = (cbq.data ?? "").split(":");
   const kind = parts[0];
-  // v/a — оригинал, rv/ra — русская озвучка (Яндекс), pd — эпизод подкаста
+  // v/a — оригинал, rv/ra — русская озвучка (Яндекс), s — субтитры, pd — эпизод
+  // подкаста, l5 — страница эпизодов из /list, del/delok/delno — отписка
   const YT_JOBS: Record<string, { type: string; note: string }> = {
-    v: { type: "yt_video", note: "Качаю видео" },
-    a: { type: "yt_audio", note: "Качаю аудио" },
-    rv: { type: "yt_video_ru", note: "Перевожу видео на русский" },
-    ra: { type: "yt_audio_ru", note: "Перевожу аудио на русский" },
+    v: { type: "yt_video", note: "Downloading video" },
+    a: { type: "yt_audio", note: "Downloading audio" },
+    rv: { type: "yt_video_ru", note: "Translating video to Russian" },
+    ra: { type: "yt_audio_ru", note: "Translating audio to Russian" },
+    s: { type: "yt_subs", note: "Fetching subtitles" },
   };
-  if (chatId !== owner || !(YT_JOBS[kind] || kind === "pd" || kind === "l5")) {
+  const KNOWN = ["pd", "l5", "del", "delok", "delno"];
+  if (chatId !== owner || !(YT_JOBS[kind] || KNOWN.includes(kind))) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
     return;
   }
   try {
-    // l5:<subId> — кнопка из /list: показать 5 последних эпизодов подписки.
-    // Кнопки списка не трогаем — список остаётся рабочим для следующих нажатий.
+    // l5:<subId>[:offset] — эпизоды подписки. Кнопки /list не трогаем (список
+    // остаётся рабочим), а вот кнопку "5 more" убираем, чтобы не дублировать.
     if (kind === "l5") {
-      await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Смотрю эпизоды…" }).catch(() => {});
-      await cmdLast(chatId, parts[1], 5);
+      await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Fetching episodes…" }).catch(() => {});
+      if (parts.length >= 3) {
+        await tg("editMessageReplyMarkup", {
+          chat_id: chatId,
+          message_id: cbq.message.message_id,
+          reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+      }
+      await cmdLast(chatId, parts[1], 5, Number(parts[2] ?? 0));
       return;
     }
+
+    // Отписка: del → подтверждение, delok → удалить, delno — отмена.
+    // Всё в одном сообщении через editMessageText.
+    if (kind === "del" || kind === "delok" || kind === "delno") {
+      await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
+      if (kind === "delno") {
+        await tg("editMessageText", {
+          chat_id: chatId,
+          message_id: cbq.message.message_id,
+          text: "Cancelled",
+        }).catch(() => {});
+        return;
+      }
+      const subId = Number(parts[1]);
+      if (kind === "del") {
+        const { data: sub } = await db.from("subscriptions").select("*").eq("id", subId).maybeSingle();
+        if (!sub) throw new Error("subscription already removed");
+        await tg("editMessageText", {
+          chat_id: chatId,
+          message_id: cbq.message.message_id,
+          text: `Unsubscribe from <b>${esc((sub as Sub).title ?? (sub as Sub).feed_url)}</b>?`,
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "✅ Yes, unsubscribe", callback_data: `delok:${subId}` },
+              { text: "✖️ Cancel", callback_data: "delno" },
+            ]],
+          },
+        });
+        return;
+      }
+      const { data } = await db.from("subscriptions").delete().eq("id", subId).select();
+      await tg("editMessageText", {
+        chat_id: chatId,
+        message_id: cbq.message.message_id,
+        text: data?.length
+          ? `✅ Unsubscribed from <b>${esc((data[0] as Sub).title ?? (data[0] as Sub).feed_url)}</b>`
+          : `No subscription #${subId}`,
+        parse_mode: "HTML",
+      }).catch(() => {});
+      return;
+    }
+
     let note: string;
     if (YT_JOBS[kind]) {
       const url = `https://www.youtube.com/watch?v=${parts[1]}`;
@@ -574,12 +718,12 @@ async function handleCallback(cbq: Record<string, any>) {
     } else {
       // pd:<subId>:<idx> — эпизод подкаста
       const { data: sub } = await db.from("subscriptions").select("*").eq("id", Number(parts[1])).maybeSingle();
-      if (!sub) throw new Error("подписка удалена");
+      if (!sub) throw new Error("subscription was removed");
       const feed = await fetchFeed((sub as Sub).feed_url);
       const ep = feed.episodes[Number(parts[2])];
-      if (!ep) throw new Error("эпизод не найден");
+      if (!ep) throw new Error("episode not found");
       await sendEpisode(chatId, ep, feed.title); // сам решит: сразу или через воркер
-      note = "Скачиваю эпизод";
+      note = "Downloading episode";
     }
     await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: `${note}…` });
     // Убираем только нажатую кнопку (защита от двойного нажатия) —
@@ -592,16 +736,13 @@ async function handleCallback(cbq: Record<string, any>) {
       message_id: cbq.message.message_id,
       reply_markup: { inline_keyboard: kb },
     }).catch(() => {});
-    if (kind === "rv" || kind === "ra") {
-      await say(chatId, `⏳ ${note} — Яндекс переводит на своих серверах, это займёт несколько минут`);
-    } else if (kind !== "pd") {
-      await say(chatId, `⏳ ${note} — пришлю файлом, когда скачается`);
-    }
   } catch (e) {
-    await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Ошибка, см. чат" }).catch(() => {});
-    await say(chatId, `⚠️ Ошибка: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
+    await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Error — see chat" }).catch(() => {});
+    await say(chatId, `⚠️ Error: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
   }
 }
+
+// ---------- Сообщения ----------
 
 // Ловим id видео в присланном тексте: youtube.com/watch, youtu.be, shorts, live, embed
 const YT_LINK = /(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^\s]*&)?v=|shorts\/|live\/|embed\/))([\w-]{11})/i;
@@ -618,7 +759,7 @@ async function handleUpdate(update: Record<string, any>) {
   if (!owner) {
     if (!textMsg.startsWith("/start")) return;
     await db.from("bot_state").upsert({ key: "owner_chat_id", value: chatId });
-    await say(chatId, "Привет! Это твой личный подкаст-бот.\n\n" + HELP);
+    await say(chatId, "Hi! This is your personal podcast bot.\n\n" + HELP);
     return;
   }
   if (chatId !== owner) return;
@@ -631,7 +772,7 @@ async function handleUpdate(update: Record<string, any>) {
     if (!cmd.startsWith("/")) {
       const yt = textMsg.match(YT_LINK);
       if (yt) await linkCard(chatId, yt[1]);
-      else await say(chatId, "Пришли ссылку на YouTube-видео — отвечу карточкой с кнопками. Остальное: /help");
+      else await say(chatId, "Send a YouTube link — I'll reply with a download card. Everything else: /help");
       return;
     }
     switch (cmd.split("@")[0].toLowerCase()) {
@@ -650,7 +791,7 @@ async function handleUpdate(update: Record<string, any>) {
         await cmdDel(chatId, arg);
         break;
       case "/latest":
-        await say(chatId, "Смотрю эпизоды за сутки…");
+        await say(chatId, "Checking the last 24 hours…");
         await cmdLatestAll(chatId);
         break;
       case "/last5":
@@ -662,13 +803,16 @@ async function handleUpdate(update: Record<string, any>) {
       case "/video":
       case "/audio": {
         if (!/^https?:\/\//i.test(arg)) {
-          await say(chatId, `Использование: <code>${cmd} ссылка-на-видео</code>`);
+          await say(chatId, `Usage: <code>${cmd} video-link</code>`);
           break;
         }
         await enqueue(cmd === "/video" ? "yt_video" : "yt_audio", { chat_id: chatId, url: arg });
-        await say(chatId, "⏳ Взял в работу — пришлю файлом, когда скачается");
+        await say(chatId, "⏳ On it — the file will arrive when it's ready");
         break;
       }
+      case "/digest":
+        await cmdDigest(chatId, arg);
+        break;
       case "/status":
         await cmdStatus(chatId);
         break;
@@ -676,11 +820,11 @@ async function handleUpdate(update: Record<string, any>) {
         await cmdClear(chatId, msg.message_id);
         break;
       default:
-        await say(chatId, "Не понял команду.\n\n" + HELP);
+        await say(chatId, "Unknown command.\n\n" + HELP);
     }
   } catch (e) {
     console.error("command failed", cmd, e);
-    await say(chatId, `⚠️ Ошибка: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
+    await say(chatId, `⚠️ Error: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
   }
 }
 
@@ -728,6 +872,12 @@ Deno.serve(async (req) => {
     } else {
       EdgeRuntime.waitUntil(handleUpdate(update));
     }
+    return new Response("ok");
+  }
+
+  if (req.headers.get("x-cron-secret") === CRON_SECRET) {
+    const body = await req.json().catch(() => ({} as Record<string, unknown>));
+    EdgeRuntime.waitUntil(handleCron(String(body?.task ?? "digest")));
     return new Response("ok");
   }
 
