@@ -63,6 +63,20 @@ async function say(chatId: string, html: string) {
   });
 }
 
+// Реакция вместо сервисного сообщения — тише в чате. Провал не критичен.
+async function react(chatId: string, messageId: number, emoji: string) {
+  await tg("setMessageReaction", {
+    chat_id: chatId,
+    message_id: messageId,
+    reaction: [{ type: "emoji", emoji }],
+  }).catch(() => {});
+}
+
+// «Печатает…» вверху чата, пока собираем ответ (живёт ~5 секунд)
+async function chatAction(chatId: string, action = "typing") {
+  await tg("sendChatAction", { chat_id: chatId, action }).catch(() => {});
+}
+
 // ---------- Фиды: RSS (подкасты) и Atom (YouTube) ----------
 
 type Episode = {
@@ -713,7 +727,8 @@ async function handleCallback(cbq: Record<string, any>) {
     let note: string;
     if (YT_JOBS[kind]) {
       const url = `https://www.youtube.com/watch?v=${parts[1]}`;
-      await enqueue(YT_JOBS[kind].type, { chat_id: chatId, url });
+      // ack_message_id: воркер поставит 👍 на карточку, когда файл отправлен
+      await enqueue(YT_JOBS[kind].type, { chat_id: chatId, url, ack_message_id: cbq.message.message_id });
       note = YT_JOBS[kind].note;
     } else {
       // pd:<subId>:<idx> — эпизод подкаста
@@ -736,6 +751,10 @@ async function handleCallback(cbq: Record<string, any>) {
       message_id: cbq.message.message_id,
       reply_markup: { inline_keyboard: kb },
     }).catch(() => {});
+    // 👀 на карточке = «взял в работу»; воркер по завершении сменит на 👍 (или 😢)
+    if (kind !== "pd") {
+      await react(chatId, cbq.message.message_id, "👀");
+    }
   } catch (e) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "Error — see chat" }).catch(() => {});
     await say(chatId, `⚠️ Error: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
@@ -771,8 +790,12 @@ async function handleUpdate(update: Record<string, any>) {
     // отвечаем карточкой с кнопками, никаких команд запоминать не нужно
     if (!cmd.startsWith("/")) {
       const yt = textMsg.match(YT_LINK);
-      if (yt) await linkCard(chatId, yt[1]);
-      else await say(chatId, "Send a YouTube link — I'll reply with a download card. Everything else: /help");
+      if (yt) {
+        await react(chatId, msg.message_id, "👀");
+        await linkCard(chatId, yt[1]);
+      } else {
+        await say(chatId, "Send a YouTube link — I'll reply with a download card. Everything else: /help");
+      }
       return;
     }
     switch (cmd.split("@")[0].toLowerCase()) {
@@ -791,7 +814,9 @@ async function handleUpdate(update: Record<string, any>) {
         await cmdDel(chatId, arg);
         break;
       case "/latest":
-        await say(chatId, "Checking the last 24 hours…");
+        // 👀 + «печатает…» вместо текстового «Checking…»
+        await react(chatId, msg.message_id, "👀");
+        await chatAction(chatId);
         await cmdLatestAll(chatId);
         break;
       case "/last5":
@@ -806,8 +831,13 @@ async function handleUpdate(update: Record<string, any>) {
           await say(chatId, `Usage: <code>${cmd} video-link</code>`);
           break;
         }
-        await enqueue(cmd === "/video" ? "yt_video" : "yt_audio", { chat_id: chatId, url: arg });
-        await say(chatId, "⏳ On it — the file will arrive when it's ready");
+        // 👀 = «взял в работу», воркер по завершении сменит на 👍 (или 😢)
+        await enqueue(cmd === "/video" ? "yt_video" : "yt_audio", {
+          chat_id: chatId,
+          url: arg,
+          ack_message_id: msg.message_id,
+        });
+        await react(chatId, msg.message_id, "👀");
         break;
       }
       case "/digest":

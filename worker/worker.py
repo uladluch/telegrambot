@@ -11,6 +11,7 @@ import pathlib
 import re
 import subprocess
 import tempfile
+import threading
 import time
 
 import requests
@@ -71,6 +72,36 @@ def check_size(path):
     if size > TG_MAX:
         raise RuntimeError(f"file is {size // 1024 // 1024} MB — over Telegram's 2 GB limit")
     return size
+
+
+def react(chat_id, message_id, emoji):
+    """Реакция вместо сервисного сообщения — тише в чате. Провал не критичен."""
+    try:
+        tg("setMessageReaction", chat_id=chat_id, message_id=message_id,
+           reaction=json.dumps([{"type": "emoji", "emoji": emoji}]), timeout=30)
+    except Exception:
+        pass
+
+
+class ActionPinger:
+    """«Отправляет видео…» вверху чата, пока задание выполняется.
+    Индикатор Telegram живёт ~5 секунд — шлём заново из фонового потока."""
+
+    def __init__(self, chat_id, action):
+        self.chat_id, self.action = chat_id, action
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                tg("sendChatAction", chat_id=self.chat_id, action=self.action, timeout=30)
+            except Exception:
+                pass
+            self._stop.wait(4.5)
+
+    def close(self):
+        self._stop.set()
 
 
 class Status:
@@ -488,6 +519,9 @@ def main():
 
         p = job["payload"]
         print(f"job {job['id']} ({job['type']}): {p.get('url', '')[:120]}", flush=True)
+        # «Отправляет видео/файл…» вверху чата на всё время задания
+        action = "upload_video" if job["type"] in ("yt_video", "yt_video_ru") else "upload_document"
+        pinger = ActionPinger(p["chat_id"], action) if p.get("chat_id") else None
         ok, err = True, None
         try:
             handler = HANDLERS.get(job["type"])
@@ -500,8 +534,17 @@ def main():
             print(f"job {job['id']} failed: {err}", flush=True)
             fallback = f'\n<a href="{p["url"]}">Source link</a>' if p.get("url") else ""
             notify(p.get("chat_id"), f"⚠️ Failed: {html.escape(err)}{fallback}")
+            # 👀 «принял» на исходном сообщении меняем на 😢
+            if p.get("ack_message_id"):
+                react(p.get("chat_id"), p["ack_message_id"], "😢")
         else:
             print(f"job {job['id']} done", flush=True)
+            # 👀 → 👍: файл отправлен
+            if p.get("ack_message_id"):
+                react(p.get("chat_id"), p["ack_message_id"], "👍")
+        finally:
+            if pinger:
+                pinger.close()
 
         try:
             edge("complete", id=job["id"], ok=ok, error=err)
