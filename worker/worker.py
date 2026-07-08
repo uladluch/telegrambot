@@ -105,73 +105,27 @@ class ActionPinger:
         self._stop.set()
 
 
-class Status:
-    """Одно редактируемое статус-сообщение на задание: живой прогресс без спама.
-    Правки не чаще раза в ~8 секунд (лимиты Telegram), в конце сообщение удаляется."""
-
-    def __init__(self, chat_id, text_msg):
-        self.chat_id = chat_id
-        self.id = None
-        self.last_edit = time.time()
-        self.last_text = text_msg
-        try:
-            self.id = tg("sendMessage", chat_id=chat_id, text=text_msg, timeout=60)["message_id"]
-        except Exception as e:
-            print("status message failed:", e, flush=True)
-
-    def edit(self, text_msg, force=False):
-        if not self.id or text_msg == self.last_text:
-            return
-        now = time.time()
-        if not force and now - self.last_edit < 8:
-            return
-        self.last_edit, self.last_text = now, text_msg
-        try:
-            tg("editMessageText", chat_id=self.chat_id, message_id=self.id,
-               text=text_msg, timeout=30)
-        except Exception:
-            pass
-
-    def close(self):
-        if self.id:
-            try:
-                tg("deleteMessage", chat_id=self.chat_id, message_id=self.id, timeout=30)
-            except Exception:
-                pass
-            self.id = None
-
-
 def do_send_audio(p, tmp):
-    st = Status(p["chat_id"], "⏳ Downloading episode…")
-    try:
-        f = tmp / "episode.mp3"
-        with requests.get(
-            p["url"], stream=True, timeout=(30, 300),
-            headers={"User-Agent": "Mozilla/5.0 (personal podcast bot)"},
-        ) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length") or 0)
-            done = 0
-            with open(f, "wb") as fh:
-                for chunk in r.iter_content(1 << 20):
-                    fh.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        st.edit(f"⏳ Downloading episode… {done * 100 // total}%")
-        check_size(f)
-        st.edit("📤 Uploading to Telegram…", force=True)
-        with open(f, "rb") as fh:
-            tg(
-                "sendAudio",
-                files={"audio": (safe_name(p.get("title") or "episode", "mp3"), fh)},
-                chat_id=p["chat_id"],
-                caption=p.get("caption", ""),
-                parse_mode="HTML",
-                title=p.get("title", ""),
-                performer=p.get("performer", ""),
-            )
-    finally:
-        st.close()
+    f = tmp / "episode.mp3"
+    with requests.get(
+        p["url"], stream=True, timeout=(30, 300),
+        headers={"User-Agent": "Mozilla/5.0 (personal podcast bot)"},
+    ) as r:
+        r.raise_for_status()
+        with open(f, "wb") as fh:
+            for chunk in r.iter_content(1 << 20):
+                fh.write(chunk)
+    check_size(f)
+    with open(f, "rb") as fh:
+        tg(
+            "sendAudio",
+            files={"audio": (safe_name(p.get("title") or "episode", "mp3"), fh)},
+            chat_id=p["chat_id"],
+            caption=p.get("caption", ""),
+            parse_mode="HTML",
+            title=p.get("title", ""),
+            performer=p.get("performer", ""),
+        )
 
 
 # В yt-dlp 2026 решатель YouTube n-challenge вынесен в отдельный EJS-компонент,
@@ -184,11 +138,8 @@ YT_BASE = [
 ]
 
 
-def run_ytdlp(url, tmp, audio_only, on_progress=None):
-    """Качает видео/аудио. on_progress(pct_str) дёргается на каждой строке прогресса."""
-    # --print-json включает quiet и глушит прогресс — возвращаем его явным --progress
-    cmd = ["yt-dlp", "--no-playlist", "--newline", "--print-json", "--progress",
-           "--progress-template", "download:PCT %(progress._percent_str)s",
+def run_ytdlp(url, tmp, audio_only):
+    cmd = ["yt-dlp", "--no-playlist", "--no-progress", "--print-json",
            *YT_BASE, "-P", str(tmp), "-o", "media.%(ext)s"]
     if COOKIES_PATH:
         cmd += ["--cookies", COOKIES_PATH]
@@ -204,7 +155,7 @@ def run_ytdlp(url, tmp, audio_only, on_progress=None):
                 "--postprocessor-args", "ffmpeg:-movflags +faststart"]
     cmd.append(url)
 
-    # stderr сливаем в stdout: прогресс, JSON с метаданными и ошибки разбираем построчно
+    # stderr сливаем в stdout: JSON с метаданными и ошибки разбираем построчно
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     info_line, tail = None, []
     for line in proc.stdout:
@@ -214,8 +165,6 @@ def run_ytdlp(url, tmp, audio_only, on_progress=None):
             tail.pop(0)
         if line.startswith("{"):
             info_line = line
-        elif line.startswith("PCT") and on_progress:
-            on_progress(line[3:].strip())
     proc.wait()
 
     if proc.returncode != 0 or not info_line:
@@ -274,36 +223,29 @@ def yt_caption(p, info, extra=""):
 
 
 def do_youtube(p, tmp, audio_only):
-    st = Status(p["chat_id"], "⏳ Preparing download…")
-    try:
-        info, f = run_ytdlp(p["url"], tmp, audio_only,
-                            on_progress=lambda pct: st.edit(f"⏳ Downloading… {pct}"))
-        # Видео не влезло в лимит — автоматически падаем на аудио
-        if not audio_only and f.stat().st_size > TG_MAX:
-            notify(p["chat_id"], "⚠️ Video is over 2 GB — sending audio only")
-            for old in tmp.iterdir():
-                old.unlink()
-            info, f = run_ytdlp(p["url"], tmp, audio_only=True,
-                                on_progress=lambda pct: st.edit(f"⏳ Downloading audio… {pct}"))
-        check_size(f)
-        cap = yt_caption(p, info)
-        title = (info.get("title") or "video")[:64]
-        channel = (info.get("channel") or info.get("uploader") or "")[:64]
-        st.edit("📤 Uploading to Telegram…", force=True)
-        with open(f, "rb") as fh:
-            if audio_only or f.suffix == ".m4a":
-                tg("sendAudio", files={"audio": (safe_name(title, "m4a"), fh)},
-                   chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-                   title=title, performer=channel,
-                   duration=int(info.get("duration") or 0))
-            else:
-                tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
-                   chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-                   supports_streaming="true",
-                   duration=int(info.get("duration") or 0),
-                   width=int(info.get("width") or 0), height=int(info.get("height") or 0))
-    finally:
-        st.close()
+    info, f = run_ytdlp(p["url"], tmp, audio_only)
+    # Видео не влезло в лимит — автоматически падаем на аудио
+    if not audio_only and f.stat().st_size > TG_MAX:
+        notify(p["chat_id"], "⚠️ Video is over 2 GB — sending audio only")
+        for old in tmp.iterdir():
+            old.unlink()
+        info, f = run_ytdlp(p["url"], tmp, audio_only=True)
+    check_size(f)
+    cap = yt_caption(p, info)
+    title = (info.get("title") or "video")[:64]
+    channel = (info.get("channel") or info.get("uploader") or "")[:64]
+    with open(f, "rb") as fh:
+        if audio_only or f.suffix == ".m4a":
+            tg("sendAudio", files={"audio": (safe_name(title, "m4a"), fh)},
+               chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+               title=title, performer=channel,
+               duration=int(info.get("duration") or 0))
+        else:
+            tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
+               chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+               supports_streaming="true",
+               duration=int(info.get("duration") or 0),
+               width=int(info.get("width") or 0), height=int(info.get("height") or 0))
 
 
 # ---------- Русская закадровая озвучка (Яндекс, через vot-cli) ----------
@@ -398,114 +340,95 @@ RU_TAG = "🔊 Russian voice-over (Yandex)"
 def do_youtube_audio_ru(p, tmp):
     # Перевод у Яндекса кэшируется глобально: популярные видео отдаются мгновенно,
     # долгий путь — только у видео, которое никто ещё не переводил.
-    st = Status(p["chat_id"], "🔊 Requesting Russian voice-over from Yandex…")
+    # Метаданные тянем параллельно с переводом — на кэшированных переводах
+    # это почти всё время задания.
+    ex = ThreadPoolExecutor(max_workers=1)
+    meta_f = ex.submit(ytdlp_meta, p["url"])
     try:
-        # Метаданные тянем параллельно с переводом — на кэшированных переводах
-        # это почти всё время задания
-        ex = ThreadPoolExecutor(max_workers=1)
-        meta_f = ex.submit(ytdlp_meta, p["url"])
-        try:
-            ru = vot_translate_audio(p["url"], tmp, p.get("lang", "auto"))
-            info = meta_f.result()
-        finally:
-            ex.shutdown(wait=False)
+        ru = vot_translate_audio(p["url"], tmp, p.get("lang", "auto"))
+        info = meta_f.result()
+    finally:
+        ex.shutdown(wait=False)
+    check_size(ru)
+    cap = yt_caption(p, info, extra=RU_TAG)
+    title = (info.get("title") or "audio")[:64]
+    channel = (info.get("channel") or info.get("uploader") or "")[:64]
+    with open(ru, "rb") as fh:
+        tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
+           chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+           title=title, performer=channel,
+           duration=int(info.get("duration") or probe_duration(ru)))
+
+
+def do_youtube_video_ru(p, tmp):
+    # Перевод запрашиваем параллельно со скачиванием видео: на кэшированных
+    # у Яндекса роликах дорожка готова раньше, чем докачается видео,
+    # и её время полностью прячется за загрузкой.
+    ex = ThreadPoolExecutor(max_workers=1)
+    vot_f = ex.submit(vot_translate_audio, p["url"], tmp, p.get("lang", "auto"))
+    try:
+        info, vf = run_ytdlp(p["url"], tmp, audio_only=False)
+        ru = vot_f.result()
+    finally:
+        ex.shutdown(wait=False)
+    title = (info.get("title") or "video")[:64]
+    channel = (info.get("channel") or info.get("uploader") or "")[:64]
+    cap = yt_caption(p, info, extra=RU_TAG)
+    out = tmp / "ru_video.mp4"
+    mux_ru(vf, ru, out)
+    # Видео с озвучкой не влезло в лимит — пришлём хотя бы русское аудио
+    if out.stat().st_size > TG_MAX:
+        notify(p["chat_id"], "⚠️ Dubbed video is over 2 GB — sending the Russian audio track only")
         check_size(ru)
-        cap = yt_caption(p, info, extra=RU_TAG)
-        title = (info.get("title") or "audio")[:64]
-        channel = (info.get("channel") or info.get("uploader") or "")[:64]
-        st.edit("📤 Uploading to Telegram…", force=True)
         with open(ru, "rb") as fh:
             tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
                chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
                title=title, performer=channel,
                duration=int(info.get("duration") or probe_duration(ru)))
-    finally:
-        st.close()
-
-
-def do_youtube_video_ru(p, tmp):
-    st = Status(p["chat_id"], "⏳ Downloading video + requesting the Russian dub…")
-    try:
-        # Перевод запрашиваем параллельно со скачиванием видео: на кэшированных
-        # у Яндекса роликах дорожка готова раньше, чем докачается видео,
-        # и её время полностью прячется за загрузкой.
-        ex = ThreadPoolExecutor(max_workers=1)
-        vot_f = ex.submit(vot_translate_audio, p["url"], tmp, p.get("lang", "auto"))
-        try:
-            info, vf = run_ytdlp(p["url"], tmp, audio_only=False,
-                                 on_progress=lambda pct: st.edit(f"⏳ Downloading video… {pct}"))
-            if not vot_f.done():
-                st.edit("🔊 Waiting for the Russian dub from Yandex… this may take a few minutes", force=True)
-            ru = vot_f.result()
-        finally:
-            ex.shutdown(wait=False)
-        st.edit("🎛 Mixing the Russian track into the video…", force=True)
-        title = (info.get("title") or "video")[:64]
-        channel = (info.get("channel") or info.get("uploader") or "")[:64]
-        cap = yt_caption(p, info, extra=RU_TAG)
-        out = tmp / "ru_video.mp4"
-        mux_ru(vf, ru, out)
-        # Видео с озвучкой не влезло в лимит — пришлём хотя бы русское аудио
-        if out.stat().st_size > TG_MAX:
-            notify(p["chat_id"], "⚠️ Dubbed video is over 2 GB — sending the Russian audio track only")
-            check_size(ru)
-            st.edit("📤 Uploading to Telegram…", force=True)
-            with open(ru, "rb") as fh:
-                tg("sendAudio", files={"audio": (safe_name(title, "mp3"), fh)},
-                   chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-                   title=title, performer=channel,
-                   duration=int(info.get("duration") or probe_duration(ru)))
-            return
-        check_size(out)
-        st.edit("📤 Uploading to Telegram…", force=True)
-        with open(out, "rb") as fh:
-            tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
-               chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
-               supports_streaming="true",
-               duration=int(info.get("duration") or 0),
-               width=int(info.get("width") or 0), height=int(info.get("height") or 0))
-    finally:
-        st.close()
+        return
+    check_size(out)
+    with open(out, "rb") as fh:
+        tg("sendVideo", files={"video": (safe_name(title, "mp4"), fh)},
+           chat_id=p["chat_id"], caption=cap, parse_mode="HTML",
+           supports_streaming="true",
+           duration=int(info.get("duration") or 0),
+           width=int(info.get("width") or 0), height=int(info.get("height") or 0))
 
 
 def do_youtube_subs(p, tmp):
     """Субтитры: сперва русский перевод через vot-cli, не вышло — родные/авто через yt-dlp."""
-    st = Status(p["chat_id"], "📝 Fetching subtitles…")
+    srt, label = None, ""
+    cmd = vot_cmd(["--subs", "--subs-format=srt", "--reslang", "ru"], tmp)
+    cmd.append(p["url"])
     try:
-        srt, label = None, ""
-        cmd = vot_cmd(["--subs", "--subs-format=srt", "--reslang", "ru"], tmp)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        files = sorted(tmp.glob("*.srt"))
+        if files:
+            srt, label = files[0], "Russian, Yandex translate"
+    except Exception as e:
+        print("vot subs failed:", e, flush=True)
+
+    if not srt:
+        cmd = ["yt-dlp", "--skip-download", "--no-playlist",
+               "--write-subs", "--write-auto-subs",
+               "--sub-langs", "en.*,ru.*", "--convert-subs", "srt",
+               *YT_BASE, "-P", str(tmp), "-o", "subs.%(ext)s"]
+        if COOKIES_PATH:
+            cmd += ["--cookies", COOKIES_PATH]
         cmd.append(p["url"])
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            files = sorted(tmp.glob("*.srt"))
-            if files:
-                srt, label = files[0], "Russian, Yandex translate"
-        except Exception as e:
-            print("vot subs failed:", e, flush=True)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        files = sorted(tmp.glob("subs*.srt"))
+        if files:
+            srt, label = files[0], "original"
 
-        if not srt:
-            cmd = ["yt-dlp", "--skip-download", "--no-playlist",
-                   "--write-subs", "--write-auto-subs",
-                   "--sub-langs", "en.*,ru.*", "--convert-subs", "srt",
-                   *YT_BASE, "-P", str(tmp), "-o", "subs.%(ext)s"]
-            if COOKIES_PATH:
-                cmd += ["--cookies", COOKIES_PATH]
-            cmd.append(p["url"])
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            files = sorted(tmp.glob("subs*.srt"))
-            if files:
-                srt, label = files[0], "original"
+    if not srt:
+        raise RuntimeError("no subtitles available for this video")
 
-        if not srt:
-            raise RuntimeError("no subtitles available for this video")
-
-        info = ytdlp_meta(p["url"])
-        title = (info.get("title") or "subtitles")[:60]
-        with open(srt, "rb") as fh:
-            tg("sendDocument", files={"document": (safe_name(title, "srt"), fh)},
-               chat_id=p["chat_id"], caption=f"📝 Subtitles ({label})")
-    finally:
-        st.close()
+    info = ytdlp_meta(p["url"])
+    title = (info.get("title") or "subtitles")[:60]
+    with open(srt, "rb") as fh:
+        tg("sendDocument", files={"document": (safe_name(title, "srt"), fh)},
+           chat_id=p["chat_id"], caption=f"📝 Subtitles ({label})")
 
 
 HANDLERS = {
