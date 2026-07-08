@@ -372,9 +372,7 @@ const HELP = `<b>Commands:</b>
 /del — unsubscribe
 /digest on|off — daily digest of new episodes (07:00 UTC)
 /status — download queue and recent errors
-/help — this help
-
-Just send (or forward) a YouTube link — you'll get a card with buttons (up to 480p, files up to 2 GB). 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), ➕ Subscribe — appears when you're not subscribed to the video's channel. 👀 on your message means I'm on it; it turns 👍 when the file is sent. Nothing is stored on the server — keep your files in the chat.`;
+/help — this help`;
 
 // Меню команд Telegram (кнопка «/» у поля ввода) — команды тапаются, а не
 // вводятся руками. Идемпотентно, обновляем при /start и /help.
