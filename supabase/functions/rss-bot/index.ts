@@ -361,7 +361,7 @@ const HELP = `<b>Commands:</b>
 /clear — wipe this chat (subscriptions stay)
 /help — this help
 
-Easiest way: just send (or forward) a YouTube link — you'll get a card with buttons. 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), 📝 Subs — subtitles file. Files up to 2 GB. Nothing is stored on the server — keep your files in the chat.`;
+Easiest way: just send (or forward) a YouTube link — you'll get a card with buttons. 🎬/🎧 EN — original video/audio, 🎬/🎧 RU — Russian voice-over by Yandex (takes a few minutes), 📝 Subs — subtitles file. 👀 on your message means I'm on it; it turns 👍 when the file is sent. Files up to 2 GB. Nothing is stored on the server — keep your files in the chat.`;
 
 async function getOwner(): Promise<string | null> {
   const { data } = await db.from("bot_state").select("value").eq("key", "owner_chat_id").maybeSingle();
