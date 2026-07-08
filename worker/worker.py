@@ -23,9 +23,10 @@ WORKER_SECRET = os.environ["WORKER_SECRET"]
 BOT_API = os.environ.get("BOT_API_URL", "http://bot-api.railway.internal:8081")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API = f"{BOT_API}/bot{BOT_TOKEN}"
-# 10 с: ~260 тыс. вызовов edge в месяц — глубоко в бесплатном лимите Supabase,
-# зато задание стартует почти сразу после нажатия кнопки
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
+# 5 с: задание стартует из простоя быстрее. 2 воркера × ~1М вызовов edge/мес —
+# глубоко в лимите Supabase Pro (2М). Пауза POLL только когда очередь пуста;
+# серия заданий разбирается без задержек.
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))
 TG_MAX = 1_950_000_000  # self-hosted bot-api пускает до 2000 МБ
 
 # Перевод на серверах Яндекса асинхронный, vot-cli сам поллит — таймаут щедрый:
@@ -159,8 +160,9 @@ YT_BASE = [
 
 
 def run_ytdlp(url, tmp, audio_only):
+    # -N 4: YouTube отдаёт видео фрагментами (DASH) — качаем 4 параллельно, а не по одному.
     cmd = ["yt-dlp", "--no-playlist", "--no-progress", "--print-json",
-           *YT_BASE, "-P", str(tmp), "-o", "media.%(ext)s"]
+           "-N", "4", *YT_BASE, "-P", str(tmp), "-o", "media.%(ext)s"]
     if COOKIES_PATH:
         cmd += ["--cookies", COOKIES_PATH]
     if audio_only:
