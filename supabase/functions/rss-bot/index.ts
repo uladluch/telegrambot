@@ -954,16 +954,24 @@ async function handleUpdate(update: Record<string, any>) {
   const [cmd, ...rest] = textMsg.trim().split(/\s+/);
   const arg = rest.join(" ");
   try {
-    // Не команда — возможно, просто ссылка на видео (или пересланное сообщение с ней):
-    // отвечаем карточкой с кнопками, никаких команд запоминать не нужно
+    // Не команда — распознаём присланную ссылку (или пересланный пост с ней):
+    // видео → карточка скачивания, ссылка на канал → сразу подписываем (как /add).
     if (!cmd.startsWith("/")) {
       const yt = textMsg.match(YT_LINK);
       if (yt) {
         await react(chatId, msg.message_id, "👀");
         await linkCard(chatId, yt[1]);
-      } else {
-        await say(chatId, "Send a YouTube link — I'll reply with a download card. Everything else: /help");
+        return;
       }
+      const urlM = textMsg.match(/https?:\/\/\S+/);
+      const url = urlM ? urlM[0] : "";
+      // Ссылка на YouTube-канал: @handle, /channel/UC…, /c/…, /user/…
+      if (url && isYoutube(url) && /youtube\.com\/(@[\w.-]+|channel\/UC[\w-]{22}|c\/|user\/)/i.test(url)) {
+        await react(chatId, msg.message_id, "👀");
+        await cmdAdd(chatId, url);
+        return;
+      }
+      await say(chatId, "Send a YouTube link: a video → download card, a channel → I'll subscribe. Everything else: /help");
       return;
     }
     switch (cmd.split("@")[0].toLowerCase()) {
