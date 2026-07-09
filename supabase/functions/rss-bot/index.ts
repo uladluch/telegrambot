@@ -507,14 +507,19 @@ async function resolveYoutubeChannelId(input: string): Promise<string> {
     signal: AbortSignal.timeout(30_000),
   });
   const html = await res.text();
-  // Канонический линк указывает на канал самой страницы; голый channelId в HTML
-  // может принадлежать «рекомендованному» соседнему каналу — он только как фолбэк
-  const m = html.match(/rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/) ??
-    html.match(/"externalId":"(UC[\w-]{22})"/) ??
-    html.match(/"channelId":"(UC[\w-]{22})"/) ??
-    html.match(/channel\/(UC[\w-]{22})/);
-  if (!m) throw new Error("couldn't detect the channel — send a youtube.com/channel/UC… link");
-  return m[1];
+  // Надёжные метки канала самой страницы: canonical и externalId.
+  const canonical = html.match(/rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/)?.[1] ??
+    html.match(/"externalId":"(UC[\w-]{22})"/)?.[1];
+  if (canonical) return canonical;
+  // Фолбэк: канал страницы упоминается в HTML чаще всего (в каждом видео, в метаданных),
+  // а «рекомендованные» каналы — реже. Берём самый частый UC-id, а не первый попавшийся:
+  // первый в документе может быть чужим (шапка/рекомендации) и дать 404 на фиде.
+  const freq = new Map<string, number>();
+  for (const m of html.matchAll(/(UC[\w-]{22})/g)) freq.set(m[1], (freq.get(m[1]) ?? 0) + 1);
+  if (freq.size) {
+    return [...freq.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
+  throw new Error("couldn't detect the channel — send a youtube.com/channel/UC… link");
 }
 
 async function resolveFeed(query: string): Promise<{ url: string; kind: string }> {
