@@ -409,9 +409,10 @@ function ytKeyboard(videoId: string, withRu: boolean) {
 async function youtubeCard(chatId: string, ep: Episode, feedTitle: string) {
   const url = ep.link ?? `https://www.youtube.com/watch?v=${ep.guid}`;
   const date = fmtDate(ep.pubDate);
+  // Заголовок ролика кликабельный, голого URL нет; превью — из link_preview_options.url
   await tg("sendMessage", {
     chat_id: chatId,
-    text: `🎬 <b>${esc(feedTitle)}</b>${date ? `\n📅 ${date}` : ""}\n${esc(url)}`,
+    text: `🎬 <a href="${esc(url)}">${esc(ep.title)}</a>\n${esc(feedTitle)}${date ? ` · ${date}` : ""}`,
     parse_mode: "HTML",
     link_preview_options: { is_disabled: false, url, prefer_large_media: true },
     reply_markup: { inline_keyboard: ytKeyboard(ep.guid, !hasCyrillic(`${feedTitle} ${ep.title}`)) },
@@ -477,17 +478,18 @@ async function podcastCard(chatId: string, sub: Sub, ep: Episode, idx: number) {
   });
 }
 
-// Карточка новости / поста из Telegram-канала: заголовок + ссылка, Telegram сам
-// развернёт превью статьи или поста. Без кнопок скачивания — это текст, не медиа.
+// Карточка новости / поста из Telegram-канала: кликабельный заголовок + превью,
+// голой ссылки нет (URL задаём в link_preview_options.url). Без кнопок — это текст.
 async function newsCard(chatId: string, sub: Sub, ep: Episode) {
   const icon = sub.kind === "tgchannel" ? "📢" : "📰";
   const date = fmtDate(ep.pubDate);
   const url = ep.link ?? "";
+  const titleHtml = url ? `<a href="${esc(url)}">${esc(ep.title)}</a>` : `<b>${esc(ep.title)}</b>`;
   await tg("sendMessage", {
     chat_id: chatId,
-    text: `${icon} <b>${esc(ep.title)}</b>\n${esc(sub.title ?? "")}${date ? ` · ${date}` : ""}\n${esc(url)}`,
+    text: `${icon} ${titleHtml}\n${esc(sub.title ?? "")}${date ? ` · ${date}` : ""}`,
     parse_mode: "HTML",
-    link_preview_options: { is_disabled: !url, url, prefer_large_media: false },
+    link_preview_options: url ? { is_disabled: false, url, prefer_large_media: false } : { is_disabled: true },
   });
 }
 
@@ -557,6 +559,27 @@ async function collectEpisodes(
     visible = candidates.filter((c) => !shorts.has(c.ep.guid));
   }
   return visible.slice(offset, offset + max);
+}
+
+// ---------- Live-лента: дедупликация уже отправленного ----------
+
+async function markSent(subId: number, guids: string[]) {
+  if (!guids.length) return;
+  await db.from("sent_items")
+    .upsert(guids.map((g) => ({ subscription_id: subId, guid: g })), {
+      onConflict: "subscription_id,guid",
+      ignoreDuplicates: true,
+    })
+    .then(() => {}, () => {});
+}
+
+// Из списка guid возвращает те, что ещё НЕ отправляли
+async function unsentGuids(subId: number, guids: string[]): Promise<Set<string>> {
+  const unsent = new Set(guids);
+  if (!guids.length) return unsent;
+  const { data } = await db.from("sent_items").select("guid").eq("subscription_id", subId).in("guid", guids);
+  for (const r of data ?? []) unsent.delete(r.guid);
+  return unsent;
 }
 
 // ---------- Погода (open-meteo — бесплатно, без ключа; целиком в edge) ----------
@@ -713,6 +736,7 @@ const HELP = `<b>Commands:</b>
 • Public Telegram channel (t.me/…) → subscribe to its posts
 /weather — current weather + 3-day forecast
 /location city — set your weather location
+/live on|off — live feed: new items arrive automatically (~5 min)
 /digest on|off — daily digest of new episodes (07:00 UTC)
 /status — download queue and recent errors
 /help — this help`;
@@ -728,6 +752,7 @@ async function registerCommands() {
       { command: "del", description: "Unsubscribe (buttons)" },
       { command: "weather", description: "Current weather + 3-day forecast" },
       { command: "location", description: "Set your weather location" },
+      { command: "live", description: "Live feed on/off — new items arrive automatically" },
       { command: "digest", description: "Daily digest on/off (07:00 UTC)" },
       { command: "status", description: "Download queue and recent errors" },
       { command: "help", description: "Help and tips" },
@@ -1002,6 +1027,30 @@ async function cmdDigest(chatId: string, arg: string) {
   await say(chatId, `Daily digest is <b>${state}</b>. Toggle: <code>/digest on</code> / <code>/digest off</code>`);
 }
 
+// Live-лента: новые items со всех подписок прилетают сами (проверка каждые ~5 мин).
+// При включении помечаем текущие items отправленными (baseline) — шлём только новое.
+async function cmdLive(chatId: string, arg: string) {
+  const v = arg.trim().toLowerCase();
+  if (v === "on" || v === "off") {
+    if (v === "on") {
+      const { data: subs } = await db.from("subscriptions").select("*").order("id");
+      await Promise.all((subs ?? []).map(async (sub) => {
+        try {
+          const feed = await fetchSubFeed(sub as Sub);
+          await markSent((sub as Sub).id, feed.episodes.slice(0, 30).map((e) => e.guid));
+        } catch { /* недоступный источник пропускаем */ }
+      }));
+    }
+    await db.from("bot_state").upsert({ key: "live", value: v });
+    await say(chatId, v === "on"
+      ? "🟢 Live feed is <b>on</b> — new items from all your subscriptions arrive automatically (checked every ~5 min)"
+      : "⚪️ Live feed is <b>off</b>");
+    return;
+  }
+  const { data } = await db.from("bot_state").select("value").eq("key", "live").maybeSingle();
+  await say(chatId, `Live feed is <b>${data?.value === "on" ? "on" : "off"}</b>. Toggle: <code>/live on</code> / <code>/live off</code>`);
+}
+
 const JOB_LABEL: Record<string, string> = {
   send_audio: "🎧 podcast",
   yt_video: "🎬 video",
@@ -1057,6 +1106,38 @@ async function handleCron(task: string) {
           .update({ status: "error", error: "timed out — killed by watchdog", updated_at: new Date().toISOString() })
           .in("id", stuck.map((j) => j.id));
         await say(owner, `⚠️ ${stuck.length} stuck download(s) marked as failed — see /status`);
+      }
+      return;
+    }
+
+    // Live-лента (каждые 5 мин): новые items со всех подписок → сразу в чат.
+    // Дедуп через sent_items; отправляем старые→новые (свежее внизу).
+    if (task === "feedcheck") {
+      const { data: liveState } = await db.from("bot_state").select("value").eq("key", "live").maybeSingle();
+      if (liveState?.value !== "on") return;
+      const { data: subs } = await db.from("subscriptions").select("*").order("id");
+      for (const sub of (subs ?? []) as Sub[]) {
+        try {
+          const feed = await fetchSubFeed(sub);
+          const recent = feed.episodes.slice(0, 15);
+          if (!recent.length) continue;
+          const unsent = await unsentGuids(sub.id, recent.map((e) => e.guid));
+          const fresh: { ep: Episode; idx: number }[] = [];
+          for (let i = 0; i < recent.length; i++) {
+            if (unsent.has(recent[i].guid)) fresh.push({ ep: recent[i], idx: i });
+          }
+          if (!fresh.length) continue;
+          // Помечаем всё свежее отправленным сразу (в т.ч. shorts, что пропустим ниже) —
+          // чтобы следующая проверка их не разбирала повторно
+          await markSent(sub.id, fresh.map((f) => f.ep.guid));
+          for (let j = fresh.length - 1; j >= 0; j--) {
+            const { ep, idx } = fresh[j];
+            if (sub.kind === "youtube" && (await isYoutubeShort(ep.guid))) continue;
+            await renderCard(owner, sub, ep, feed.title, idx);
+          }
+        } catch (e) {
+          console.error("feedcheck failed for", sub.feed_url, e);
+        }
       }
       return;
     }
@@ -1382,6 +1463,9 @@ async function handleUpdate(update: Record<string, any>) {
         break;
       case "/digest":
         await cmdDigest(chatId, arg);
+        break;
+      case "/live":
+        await cmdLive(chatId, arg);
         break;
       case "/status":
         await cmdStatus(chatId);
