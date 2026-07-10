@@ -144,6 +144,92 @@ async function fetchFeed(url: string): Promise<{ title: string; episodes: Episod
   return { title: text(channel.title) ?? url, episodes };
 }
 
+// ---------- Автообнаружение RSS и чтение Telegram-каналов ----------
+
+const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
+}
+
+// Ищем RSS/Atom-фид по ссылке на сайт или статью: сначала — вдруг это уже фид,
+// затем <link rel=alternate type=rss/atom> в HTML, затем типичные пути.
+async function discoverFeed(input: string): Promise<string | null> {
+  const tryFeed = async (u: string): Promise<boolean> => {
+    try {
+      const f = await fetchFeed(u);
+      return f.episodes.length > 0;
+    } catch {
+      return false;
+    }
+  };
+  if (await tryFeed(input)) return input;
+
+  let origin: string;
+  try {
+    origin = new URL(input).origin;
+  } catch {
+    return null;
+  }
+  try {
+    const res = await fetch(input, { headers: { "User-Agent": BROWSER_UA }, redirect: "follow", signal: AbortSignal.timeout(15_000) });
+    const html = await res.text();
+    for (const tag of html.matchAll(/<link[^>]+type=["']application\/(?:rss|atom)\+xml["'][^>]*>/gi)) {
+      const href = tag[0].match(/href=["']([^"']+)["']/i)?.[1];
+      if (!href) continue;
+      const feedUrl = new URL(decodeEntities(href), origin).href;
+      if (await tryFeed(feedUrl)) return feedUrl;
+    }
+  } catch { /* нет HTML — пробуем типичные пути */ }
+
+  for (const p of ["/feed", "/feed/", "/rss", "/rss.xml", "/feed.xml", "/atom.xml", "/index.xml", "/?feed=rss2"]) {
+    if (await tryFeed(origin + p)) return origin + p;
+  }
+  return null;
+}
+
+// Читаем публичный Telegram-канал через веб-превью t.me/s/<username> (скрейпинг HTML).
+// Пост → «эпизод»: первая строка как заголовок, ссылка на пост (Telegram развернёт превью).
+async function fetchTgChannel(url: string): Promise<{ title: string; episodes: Episode[] }> {
+  const username = url.match(/t\.me\/s\/([\w\d_]+)/i)?.[1] ?? "";
+  const res = await fetch(`https://t.me/s/${username}`, {
+    headers: { "User-Agent": BROWSER_UA },
+    redirect: "follow",
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`Telegram channel HTTP ${res.status} (public channel?)`);
+  const html = await res.text();
+  const title = decodeEntities(html.match(/<meta property="og:title" content="([^"]*)"/)?.[1] ?? `@${username}`);
+  const episodes: Episode[] = [];
+  for (const block of html.split('data-post="').slice(1)) {
+    const idM = block.match(/^[\w\d_]+\/(\d+)"/);
+    if (!idM) continue;
+    const postId = idM[1];
+    const pubDate = block.match(/<time[^>]+datetime="([^"]+)"/)?.[1];
+    const textHtml = block.match(/<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)<\/div>\s*<div class="tgme_widget_message_footer/s)?.[1]
+      ?? block.match(/<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)<\/div>/s)?.[1] ?? "";
+    const clean = decodeEntities(textHtml.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")).trim();
+    const firstLine = (clean.split("\n").find((l) => l.trim()) ?? "").slice(0, 140);
+    episodes.push({
+      guid: postId,
+      title: firstLine || `Post #${postId}`,
+      link: `https://t.me/${username}/${postId}`,
+      pubDate,
+    });
+  }
+  episodes.sort((a, b) => (Date.parse(b.pubDate ?? "") || 0) - (Date.parse(a.pubDate ?? "") || 0));
+  return { title, episodes };
+}
+
+// Диспетчер источника по типу подписки
+async function fetchSubFeed(sub: Sub): Promise<{ title: string; episodes: Episode[] }> {
+  if (sub.kind === "tgchannel") return fetchTgChannel(sub.feed_url);
+  return fetchFeed(sub.feed_url);
+}
+
 // ---------- Отправка эпизода подкаста ----------
 
 function fmtDate(d?: string) {
@@ -391,10 +477,25 @@ async function podcastCard(chatId: string, sub: Sub, ep: Episode, idx: number) {
   });
 }
 
+// Карточка новости / поста из Telegram-канала: заголовок + ссылка, Telegram сам
+// развернёт превью статьи или поста. Без кнопок скачивания — это текст, не медиа.
+async function newsCard(chatId: string, sub: Sub, ep: Episode) {
+  const icon = sub.kind === "tgchannel" ? "📢" : "📰";
+  const date = fmtDate(ep.pubDate);
+  const url = ep.link ?? "";
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: `${icon} <b>${esc(ep.title)}</b>\n${esc(sub.title ?? "")}${date ? ` · ${date}` : ""}\n${esc(url)}`,
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: !url, url, prefer_large_media: false },
+  });
+}
+
 // Рендерит карточку эпизода (без проверки shorts — она делается при сборе).
 async function renderCard(chatId: string, sub: Sub, ep: Episode, feedTitle: string, idx: number) {
   if (sub.kind === "youtube") await youtubeCard(chatId, ep, feedTitle);
-  else await podcastCard(chatId, sub, ep, idx);
+  else if (sub.kind === "podcast") await podcastCard(chatId, sub, ep, idx);
+  else await newsCard(chatId, sub, ep); // rss, tgchannel
 }
 
 // Параллельный map с ограничением одновременных задач (чтобы не завалить YouTube пачкой HEAD).
@@ -601,10 +702,15 @@ async function cmdLocation(chatId: string, arg: string) {
 // ---------- Команды ----------
 
 const HELP = `<b>Commands:</b>
-/latest — new episodes from all subscriptions (last 24h)
-/list — subscriptions as buttons: tap one for its latest episode
+/latest — new items from all subscriptions (last 24h)
+/list — subscriptions as buttons: tap one for its latest item
 /add link or name — podcast or YouTube channel
 /del — unsubscribe
+
+<b>Just send a link</b> — I'll figure it out:
+• YouTube video → download card · channel → subscribe
+• News site or article → I'll find its RSS and ask to subscribe
+• Public Telegram channel (t.me/…) → subscribe to its posts
 /weather — current weather + 3-day forecast
 /location city — set your weather location
 /digest on|off — daily digest of new episodes (07:00 UTC)
@@ -709,8 +815,60 @@ async function cmdAdd(chatId: string, arg: string) {
   );
 }
 
+// Предложение подписки с подтверждением: pending-фид кладём в bot_state,
+// кнопки psub/pno подтверждают/отменяют. Дубли отсекаем сразу.
+async function offerFeed(chatId: string, feedUrl: string, kind: string, title: string, latest?: string) {
+  const { data: existing } = await db.from("subscriptions").select("id").eq("feed_url", feedUrl).maybeSingle();
+  if (existing) {
+    await say(chatId, `Already subscribed to <b>${esc(title)}</b>`);
+    return;
+  }
+  await db.from("bot_state").upsert({ key: "pending_feed", value: JSON.stringify({ feed_url: feedUrl, title, kind }) });
+  const icon = kind === "tgchannel" ? "📢" : "📰";
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: `${icon} <b>${esc(title)}</b>${latest ? `\nLatest: ${esc(latest)}` : ""}\n\nSubscribe?`,
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Subscribe", callback_data: "psub" },
+        { text: "✖️ No", callback_data: "pno" },
+      ]],
+    },
+  });
+}
+
+async function offerRssFeed(chatId: string, url: string) {
+  const feedUrl = await discoverFeed(url);
+  if (!feedUrl) {
+    await say(chatId, "Couldn't find an RSS feed on this site. Some sites (e.g. X) don't publish one.");
+    return;
+  }
+  const feed = await fetchFeed(feedUrl);
+  await offerFeed(chatId, feedUrl, "rss", feed.title, feed.episodes[0]?.title);
+}
+
+async function offerTgChannel(chatId: string, username: string) {
+  const feedUrl = `https://t.me/s/${username}`;
+  let feed: { title: string; episodes: Episode[] };
+  try {
+    feed = await fetchTgChannel(feedUrl);
+  } catch {
+    await say(chatId, `Couldn't read @${esc(username)} — is it a public channel?`);
+    return;
+  }
+  if (!feed.episodes.length) {
+    await say(chatId, `@${esc(username)} has no readable posts (private, or preview disabled)`);
+    return;
+  }
+  await offerFeed(chatId, feedUrl, "tgchannel", feed.title, feed.episodes[0]?.title);
+}
+
+const KIND_ICON: Record<string, string> = { youtube: "🎬", podcast: "🎧", rss: "📰", tgchannel: "📢" };
+
 function subButtonLabel(s: Sub) {
-  return `${s.kind === "youtube" ? "🎬" : "🎧"} ${(s.title ?? s.feed_url).slice(0, 48)}`;
+  return `${KIND_ICON[s.kind] ?? "🔗"} ${(s.title ?? s.feed_url).slice(0, 48)}`;
 }
 
 // Каждая подписка — кнопка: тап → последний эпизод, глубже — через «⬇️ 5 more».
@@ -770,7 +928,7 @@ async function cmdLatestAll(chatId: string, digest = false) {
   // Фиды тянем параллельно — 7 подписок за время одного запроса, а не семи подряд
   const perSub = await Promise.all((subs as Sub[]).map(async (sub) => {
     try {
-      const feed = await fetchFeed(sub.feed_url);
+      const feed = await fetchSubFeed(sub);
       const picked = await collectEpisodes(
         sub,
         feed.episodes,
@@ -807,7 +965,7 @@ async function cmdLast(chatId: string, arg: string, n: number, offset = 0) {
     await say(chatId, `No subscription #${id}`);
     return;
   }
-  const feed = await fetchFeed((sub as Sub).feed_url);
+  const feed = await fetchSubFeed(sub as Sub);
   const picked = await collectEpisodes(sub as Sub, feed.episodes, () => true, n, offset);
   // Старые → новые, чтобы самый свежий оказался внизу чата
   for (let j = picked.length - 1; j >= 0; j--) {
@@ -940,7 +1098,7 @@ async function handleCallback(cbq: Record<string, any>) {
     ra: { type: "yt_audio_ru", note: "Translating audio to Russian" },
     s: { type: "yt_subs", note: "Fetching subtitles" },
   };
-  const KNOWN = ["pd", "l5", "del", "delok", "delno", "sub", "wx7"];
+  const KNOWN = ["pd", "l5", "del", "delok", "delno", "sub", "wx7", "psub", "pno"];
   if (chatId !== owner || !(YT_JOBS[kind] || KNOWN.includes(kind))) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
     return;
@@ -951,6 +1109,32 @@ async function handleCallback(cbq: Record<string, any>) {
       await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "7-day forecast" }).catch(() => {});
       const loc = await getLocation();
       await say(chatId, await weatherText(loc, 7));
+      return;
+    }
+
+    // psub/pno — подтверждение подписки на новостной RSS или Telegram-канал
+    if (kind === "psub" || kind === "pno") {
+      await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
+      const { data: pending } = await db.from("bot_state").select("value").eq("key", "pending_feed").maybeSingle();
+      await db.from("bot_state").delete().eq("key", "pending_feed");
+      if (kind === "pno") {
+        await tg("editMessageText", { chat_id: chatId, message_id: cbq.message.message_id, text: "Cancelled" }).catch(() => {});
+        return;
+      }
+      if (!pending?.value) {
+        await tg("editMessageText", { chat_id: chatId, message_id: cbq.message.message_id, text: "This offer expired — send the link again" }).catch(() => {});
+        return;
+      }
+      const pf = JSON.parse(pending.value);
+      const { error } = await db.from("subscriptions").insert({ feed_url: pf.feed_url, title: pf.title, kind: pf.kind });
+      await tg("editMessageText", {
+        chat_id: chatId,
+        message_id: cbq.message.message_id,
+        text: (error && error.code === "23505")
+          ? `Already subscribed to <b>${esc(pf.title)}</b>`
+          : `✅ Subscribed: <b>${esc(pf.title)}</b> — new items appear in /latest and /list`,
+        parse_mode: "HTML",
+      }).catch(() => {});
       return;
     }
 
@@ -1059,7 +1243,7 @@ async function handleCallback(cbq: Record<string, any>) {
       // pd:<subId>:<idx> — эпизод подкаста
       const { data: sub } = await db.from("subscriptions").select("*").eq("id", Number(parts[1])).maybeSingle();
       if (!sub) throw new Error("subscription was removed");
-      const feed = await fetchFeed((sub as Sub).feed_url);
+      const feed = await fetchSubFeed(sub as Sub);
       const ep = feed.episodes[Number(parts[2])];
       if (!ep) throw new Error("episode not found");
       const cacheKey = `pod:${ep.guid}`;
@@ -1149,7 +1333,21 @@ async function handleUpdate(update: Record<string, any>) {
         await cmdAdd(chatId, url);
         return;
       }
-      await say(chatId, "Send a YouTube link: a video → download card, a channel → I'll subscribe. Everything else: /help");
+      // Ссылка на публичный Telegram-канал: t.me/name или t.me/s/name (не инвайты)
+      const tgm = url.match(/t\.me\/(?:s\/)?([\w\d_]{4,})/i);
+      if (url && tgm && !/t\.me\/(joinchat|\+)/i.test(url)) {
+        await react(chatId, msg.message_id, "👀");
+        await offerTgChannel(chatId, tgm[1]);
+        return;
+      }
+      // Любая другая ссылка — новостной сайт/статья: ищем RSS и предлагаем подписку
+      if (url) {
+        await react(chatId, msg.message_id, "👀");
+        await chatAction(chatId);
+        await offerRssFeed(chatId, url);
+        return;
+      }
+      await say(chatId, "Send a link: YouTube video/channel, a news site, or a public Telegram channel. Help: /help");
       return;
     }
     switch (cmd.split("@")[0].toLowerCase()) {
