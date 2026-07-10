@@ -725,21 +725,20 @@ async function cmdLocation(chatId: string, arg: string) {
 // ---------- Команды ----------
 
 const HELP = `<b>Commands:</b>
+/live on|off — live feed: new items arrive automatically (~5 min)
 /latest — new items from all subscriptions (last 24h)
-/list — subscriptions as buttons: tap one for its latest item
+/list — subscriptions as buttons
 /add link or name — podcast or YouTube channel
 /del — unsubscribe
+/weather — current weather + 3-day forecast
+/location city — set your weather location
+/status — download queue and recent errors
+/help — this help
 
 <b>Just send a link</b> — I'll figure it out:
 • YouTube video → download card · channel → subscribe
 • News site or article → I'll find its RSS and ask to subscribe
-• Public Telegram channel (t.me/…) → subscribe to its posts
-/weather — current weather + 3-day forecast
-/location city — set your weather location
-/live on|off — live feed: new items arrive automatically (~5 min)
-/digest on|off — daily digest of new episodes (07:00 UTC)
-/status — download queue and recent errors
-/help — this help`;
+• Public Telegram channel (t.me/…) → subscribe to its posts`;
 
 // Меню команд Telegram (кнопка «/» у поля ввода) — команды тапаются, а не
 // вводятся руками. Идемпотентно, обновляем при /start и /help.
@@ -750,10 +749,9 @@ async function registerCommands() {
       { command: "list", description: "Subscriptions — tap one for its latest episode" },
       { command: "add", description: "Subscribe: /add link or name" },
       { command: "del", description: "Unsubscribe (buttons)" },
+      { command: "live", description: "Live feed on/off — new items arrive automatically" },
       { command: "weather", description: "Current weather + 3-day forecast" },
       { command: "location", description: "Set your weather location" },
-      { command: "live", description: "Live feed on/off — new items arrive automatically" },
-      { command: "digest", description: "Daily digest on/off (07:00 UTC)" },
       { command: "status", description: "Download queue and recent errors" },
       { command: "help", description: "Help and tips" },
     ],
@@ -1000,8 +998,9 @@ async function cmdLast(chatId: string, arg: string, n: number, offset = 0) {
     await say(chatId, offset ? "No more episodes" : "The feed has no episodes");
     return;
   }
-  // Полная порция — вероятно, есть ещё: кнопка следующей страницы
-  if (picked.length === n) {
+  // Полная порция — вероятно, есть ещё: кнопка следующей страницы.
+  // Для новостей/Telegram (rss/tgchannel) «5 more» не нужен — их читаем живой лентой.
+  if (picked.length === n && ((sub as Sub).kind === "youtube" || (sub as Sub).kind === "podcast")) {
     await tg("sendMessage", {
       chat_id: chatId,
       text: `More from <b>${esc(feed.title)}</b>?`,
