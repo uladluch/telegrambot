@@ -458,6 +458,113 @@ async function collectEpisodes(
   return visible.slice(offset, offset + max);
 }
 
+// ---------- Погода (open-meteo — бесплатно, без ключа; целиком в edge) ----------
+
+type Loc = { lat: number; lon: number; name: string };
+const DEFAULT_LOC: Loc = { lat: 52.2297, lon: 21.0122, name: "Warsaw" };
+
+async function getLocation(): Promise<Loc> {
+  const { data } = await db.from("bot_state").select("value").eq("key", "weather_loc").maybeSingle();
+  if (!data?.value) return DEFAULT_LOC;
+  try {
+    return JSON.parse(data.value);
+  } catch {
+    return DEFAULT_LOC;
+  }
+}
+
+// Геокодинг названия города в координаты (open-meteo geocoding, бесплатно)
+async function geocode(city: string): Promise<Loc | null> {
+  const res = await fetch(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`,
+    { signal: AbortSignal.timeout(15_000) },
+  );
+  const data = await res.json();
+  const r = data.results?.[0];
+  if (!r) return null;
+  return { lat: r.latitude, lon: r.longitude, name: [r.name, r.country_code].filter(Boolean).join(", ") };
+}
+
+// WMO weather code → эмодзи + короткое описание
+function wmo(code: number): { emoji: string; desc: string } {
+  if (code === 0) return { emoji: "☀️", desc: "clear" };
+  if (code <= 2) return { emoji: "🌤", desc: "partly cloudy" };
+  if (code === 3) return { emoji: "☁️", desc: "overcast" };
+  if (code <= 48) return { emoji: "🌫", desc: "fog" };
+  if (code <= 57) return { emoji: "🌦", desc: "drizzle" };
+  if (code <= 67) return { emoji: "🌧", desc: "rain" };
+  if (code <= 77) return { emoji: "🌨", desc: "snow" };
+  if (code <= 82) return { emoji: "🌧", desc: "showers" };
+  if (code <= 86) return { emoji: "🌨", desc: "snow showers" };
+  return { emoji: "⛈", desc: "thunderstorm" };
+}
+
+async function fetchWeather(loc: Loc): Promise<Record<string, any>> {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}` +
+    `&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m` +
+    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum` +
+    `&timezone=auto&forecast_days=8`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`weather API HTTP ${res.status}`);
+  return await res.json();
+}
+
+function precipLine(prob: number, sum: number): string {
+  return (prob >= 40 || sum >= 1) ? `🌧 rain ${Math.round(prob)}%` : "no rain";
+}
+
+function dayName(iso: string): string {
+  const d = new Date(iso + "T12:00:00Z");
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()];
+}
+
+// Текст погоды: сейчас + сегодня (день/ночь) + следующие N дней (темп день/ночь + осадки)
+async function weatherText(loc: Loc, days: number): Promise<string> {
+  const w = await fetchWeather(loc);
+  const c = w.current;
+  const dl = w.daily;
+  const cw = wmo(c.weather_code);
+  const lines = [
+    `${cw.emoji} <b>${esc(loc.name)}</b> — now, ${cw.desc}`,
+    `🌡 ${Math.round(c.temperature_2m)}°C (feels ${Math.round(c.apparent_temperature)}°) · 💧 ${c.relative_humidity_2m}% · 💨 ${Math.round(c.wind_speed_10m)} km/h`,
+  ];
+  if (c.precipitation > 0) lines.push(`🌧 precipitation now: ${c.precipitation} mm`);
+  const t = wmo(dl.weather_code[0]);
+  lines.push("", `<b>Today</b> ${t.emoji} day ${Math.round(dl.temperature_2m_max[0])}° / night ${Math.round(dl.temperature_2m_min[0])}° · ${precipLine(dl.precipitation_probability_max[0] ?? 0, dl.precipitation_sum[0] ?? 0)}`);
+  lines.push("", `<b>Next ${days} days:</b>`);
+  for (let i = 1; i <= days && i < dl.time.length; i++) {
+    const dw = wmo(dl.weather_code[i]);
+    lines.push(`${dayName(dl.time[i])} ${dw.emoji} ${Math.round(dl.temperature_2m_max[i])}°/${Math.round(dl.temperature_2m_min[i])}° · ${precipLine(dl.precipitation_probability_max[i] ?? 0, dl.precipitation_sum[i] ?? 0)}`);
+  }
+  return lines.join("\n");
+}
+
+async function cmdWeather(chatId: string) {
+  const loc = await getLocation();
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: await weatherText(loc, 3),
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    reply_markup: { inline_keyboard: [[{ text: "📅 7-day forecast", callback_data: "wx7" }]] },
+  });
+}
+
+async function cmdLocation(chatId: string, arg: string) {
+  if (!arg) {
+    const loc = await getLocation();
+    await say(chatId, `📍 Current location: <b>${esc(loc.name)}</b>\nChange it: <code>/location Berlin</code>`);
+    return;
+  }
+  const loc = await geocode(arg);
+  if (!loc) {
+    await say(chatId, `Couldn't find "${esc(arg)}" — try another spelling or a bigger nearby city`);
+    return;
+  }
+  await db.from("bot_state").upsert({ key: "weather_loc", value: JSON.stringify(loc) });
+  await say(chatId, `📍 Location set: <b>${esc(loc.name)}</b>. Check /weather`);
+}
+
 // ---------- Команды ----------
 
 const HELP = `<b>Commands:</b>
@@ -465,6 +572,8 @@ const HELP = `<b>Commands:</b>
 /list — subscriptions as buttons: tap one for its latest episode
 /add link or name — podcast or YouTube channel
 /del — unsubscribe
+/weather — current weather + 3-day forecast
+/location city — set your weather location
 /digest on|off — daily digest of new episodes (07:00 UTC)
 /status — download queue and recent errors
 /help — this help`;
@@ -478,6 +587,8 @@ async function registerCommands() {
       { command: "list", description: "Subscriptions — tap one for its latest episode" },
       { command: "add", description: "Subscribe: /add link or name" },
       { command: "del", description: "Unsubscribe (buttons)" },
+      { command: "weather", description: "Current weather + 3-day forecast" },
+      { command: "location", description: "Set your weather location" },
       { command: "digest", description: "Daily digest on/off (07:00 UTC)" },
       { command: "status", description: "Download queue and recent errors" },
       { command: "help", description: "Help and tips" },
@@ -759,9 +870,20 @@ async function handleCron(task: string) {
       return;
     }
 
-    // Дайджест: карточки новых эпизодов; в тихие дни — ничего
+    // Дайджест: погода-интро + карточки новых эпизодов (эпизоды в тихие дни — ничего)
     const { data } = await db.from("bot_state").select("value").eq("key", "digest").maybeSingle();
     if (data?.value === "off") return;
+    try {
+      const loc = await getLocation();
+      await tg("sendMessage", {
+        chat_id: owner,
+        text: "☀️ <b>Good morning</b>\n\n" + await weatherText(loc, 3),
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (e) {
+      console.error("weather digest intro failed", e);
+    }
     await cmdLatestAll(owner, true);
   } catch (e) {
     console.error("cron task failed", task, e);
@@ -785,12 +907,20 @@ async function handleCallback(cbq: Record<string, any>) {
     ra: { type: "yt_audio_ru", note: "Translating audio to Russian" },
     s: { type: "yt_subs", note: "Fetching subtitles" },
   };
-  const KNOWN = ["pd", "l5", "del", "delok", "delno", "sub"];
+  const KNOWN = ["pd", "l5", "del", "delok", "delno", "sub", "wx7"];
   if (chatId !== owner || !(YT_JOBS[kind] || KNOWN.includes(kind))) {
     await tg("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {});
     return;
   }
   try {
+    // wx7 — кнопка «7-day forecast» под погодой
+    if (kind === "wx7") {
+      await tg("answerCallbackQuery", { callback_query_id: cbq.id, text: "7-day forecast" }).catch(() => {});
+      const loc = await getLocation();
+      await say(chatId, await weatherText(loc, 7));
+      return;
+    }
+
     // l5:<subId> — тап по каналу в /list: только последний эпизод.
     // l5:<subId>:<offset> — кнопка «⬇️ 5 more»: следующая пятёрка; саму кнопку
     // убираем, чтобы не дублировать. Кнопки /list не трогаем — список остаётся рабочим.
@@ -995,6 +1125,14 @@ async function handleUpdate(update: Record<string, any>) {
         await react(chatId, msg.message_id, "👀");
         await chatAction(chatId);
         await cmdLatestAll(chatId);
+        break;
+      case "/weather":
+        await chatAction(chatId);
+        await cmdWeather(chatId);
+        break;
+      case "/location":
+      case "/loc":
+        await cmdLocation(chatId, arg);
         break;
       case "/digest":
         await cmdDigest(chatId, arg);
