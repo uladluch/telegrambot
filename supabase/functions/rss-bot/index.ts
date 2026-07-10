@@ -485,6 +485,24 @@ async function geocode(city: string): Promise<Loc | null> {
   return { lat: r.latitude, lon: r.longitude, name: [r.name, r.country_code].filter(Boolean).join(", ") };
 }
 
+// Обратный геокодинг координат в название города (Nominatim/OSM, бесплатно, без ключа;
+// надёжнее с серверного IP, чем клиентские API — требует лишь User-Agent).
+// Для кнопки «отправить местоположение» из Telegram.
+async function reverseGeocode(lat: number, lon: number): Promise<string> {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&accept-language=en&zoom=10`,
+      { headers: { "User-Agent": "personal-podcast-bot/1.0" }, signal: AbortSignal.timeout(10_000) },
+    );
+    const a = (await res.json()).address ?? {};
+    const city = a.city || a.town || a.village || a.municipality || a.county || a.state || "";
+    const cc = String(a.country_code ?? "").toUpperCase();
+    return [city, cc].filter(Boolean).join(", ") || `${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+  } catch {
+    return `${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+  }
+}
+
 // WMO weather code → эмодзи + короткое описание
 function wmo(code: number): { emoji: string; desc: string } {
   if (code === 0) return { emoji: "☀️", desc: "clear" };
@@ -550,10 +568,26 @@ async function cmdWeather(chatId: string) {
   });
 }
 
+async function saveLocation(chatId: string, loc: Loc, showWeather = false) {
+  await db.from("bot_state").upsert({ key: "weather_loc", value: JSON.stringify(loc) });
+  await say(chatId, `📍 Location set: <b>${esc(loc.name)}</b>. Check /weather`);
+  if (showWeather) await cmdWeather(chatId);
+}
+
 async function cmdLocation(chatId: string, arg: string) {
   if (!arg) {
     const loc = await getLocation();
-    await say(chatId, `📍 Current location: <b>${esc(loc.name)}</b>\nChange it: <code>/location Berlin</code>`);
+    // Reply-кнопка «отправить местоположение» — Telegram пришлёт геолокацию как message.location
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: `📍 Current location: <b>${esc(loc.name)}</b>\nType a city — <code>/location Reykjavik</code> — or tap the button to use your GPS:`,
+      parse_mode: "HTML",
+      reply_markup: {
+        keyboard: [[{ text: "📍 Send my location", request_location: true }]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    });
     return;
   }
   const loc = await geocode(arg);
@@ -561,8 +595,7 @@ async function cmdLocation(chatId: string, arg: string) {
     await say(chatId, `Couldn't find "${esc(arg)}" — try another spelling or a bigger nearby city`);
     return;
   }
-  await db.from("bot_state").upsert({ key: "weather_loc", value: JSON.stringify(loc) });
-  await say(chatId, `📍 Location set: <b>${esc(loc.name)}</b>. Check /weather`);
+  await saveLocation(chatId, loc);
 }
 
 // ---------- Команды ----------
@@ -1067,9 +1100,9 @@ const YT_LINK = /(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^\s]*&)?v=|shorts\/|
 async function handleUpdate(update: Record<string, any>) {
   const msg = update.message;
   const chatId = String(msg?.chat?.id ?? "");
+  if (!chatId) return;
   // caption — на случай пересланного поста с видео/картинкой и ссылкой в подписи
   const textMsg: string = msg?.text ?? msg?.caption ?? "";
-  if (!chatId || !textMsg) return;
 
   // Личный бот: первый, кто напишет /start, становится владельцем, остальных игнорируем
   const owner = await getOwner();
@@ -1080,6 +1113,21 @@ async function handleUpdate(update: Record<string, any>) {
     return;
   }
   if (chatId !== owner) return;
+
+  // Присланная геолокация (кнопка «отправить местоположение») → место для погоды.
+  // Клавиатура скроется сама (one_time_keyboard); reverse geocode даёт название города.
+  if (msg.location) {
+    try {
+      const { latitude, longitude } = msg.location;
+      const name = await reverseGeocode(latitude, longitude);
+      await saveLocation(chatId, { lat: latitude, lon: longitude, name }, true);
+    } catch (e) {
+      await say(chatId, `⚠️ Error: ${esc(String((e as Error).message ?? e))}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (!textMsg) return;
 
   const [cmd, ...rest] = textMsg.trim().split(/\s+/);
   const arg = rest.join(" ");
